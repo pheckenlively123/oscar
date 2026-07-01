@@ -24,6 +24,7 @@ info()  { printf '%s==>%s %s\n' "$bold" "$reset" "$*"; }
 ok()    { printf '%s[ OK ]%s %s\n' "$green" "$reset" "$*"; }
 warn()  { printf '%s[WARN]%s %s\n' "$yellow" "$reset" "$*"; }
 fail()  { printf '%s[FAIL]%s %s\n' "$red" "$reset" "$*"; }
+alert() { printf '%s%s[ALRT]%s %s\n' "$bold" "$yellow" "$reset" "$*"; }
 
 # Track results for the final summary.
 declare -a RESULTS=()
@@ -40,12 +41,13 @@ run_step() {
     shift
     [[ "${1:-}" == "--" ]] && shift
 
-    local -a ok_codes=(0 ${OK_CODES:-})
+    read -ra ok_codes <<< "0 ${OK_CODES:-}"
     OK_CODES=""  # reset for the next call
 
     if [[ $# -eq 0 ]]; then
+        # Defensive assertion — all call sites pass a command; this branch should not be reached.
         fail "run_step: '${label}' — no command specified."
-        RESULTS+=("FAIL ${label} (no command)")
+        RESULTS+=("FAIL ${label} (exit 1)")
         return 1
     fi
 
@@ -69,14 +71,19 @@ run_step() {
 # --- identify the invoking (non-root) user ---------------------------------
 # Captured BEFORE we elevate, so we can run user-scope flatpak as them.
 INVOKING_USER="${SUDO_USER:-$USER}"
+CURRENT_USER="$(id -un)"   # cached; always "root" after the privilege re-exec
 
 # as_user <command...> — run a command as the invoking user.
 # Falls back to running directly if we're already that user.
+#
+# Note: if INVOKING_USER is "root" (direct root execution without sudo),
+# user-scope operations run as root — known limitation; see the warning
+# emitted after the privilege check for details.
 as_user() {
-    if [[ "$INVOKING_USER" == "root" || "$(id -un)" == "$INVOKING_USER" ]]; then
+    if [[ "$INVOKING_USER" == "root" || "$CURRENT_USER" == "$INVOKING_USER" ]]; then
         "$@"
     else
-        sudo -u "$INVOKING_USER" "$@"
+        sudo -Hu "$INVOKING_USER" "$@"
     fi
 }
 
@@ -94,6 +101,29 @@ if [[ $EUID -ne 0 ]]; then
         fail "This script needs root (for dnf/snap/fwupd) and sudo is not available."
         exit 1
     fi
+fi
+
+# --- argument guard --------------------------------------------------------
+# This script takes no arguments. Validate once, as root, after re-exec so
+# the check fires exactly once regardless of how the script was invoked.
+if [[ $# -gt 0 ]]; then
+    fail "Usage: update-all.sh  (no arguments accepted)"
+    exit 1
+fi
+
+# --- mutual exclusion guard ------------------------------------------------
+# Prevent concurrent invocations from racing on the RPM db lock,
+# the PackageKit daemon, or the fwupd daemon. Uses a non-blocking flock so
+# a second invocation fails immediately rather than hanging indefinitely.
+exec 9>/run/update-all.lock
+flock -n 9 || { fail "Another update-all is already running."; exit 1; }
+
+# --- direct root invocation warning ----------------------------------------
+# When the script is run as root without sudo (e.g. after `sudo su -`),
+# SUDO_USER is unset so INVOKING_USER is "root". The user-scope flatpak
+# update will then run against /root/.local rather than the real user's home.
+if [[ "$INVOKING_USER" == "root" ]]; then
+    warn "SUDO_USER not set — user-scope flatpak will run as root's installation. Run via: sudo ./update-all.sh"
 fi
 
 # --- the updates -----------------------------------------------------------
@@ -115,6 +145,12 @@ else
 fi
 
 # 2. dnf — system RPM packages.
+#
+# NOTE: packagekitd runs as a persistent daemon and may hold the RPM
+# transaction lock. If `dnf upgrade` exits non-zero with a lock error,
+# KDE Discover or the Plasma update notifier may be active — close them
+# and retry. The flock guard above prevents a second update-all from
+# racing this step, but it does not quiesce the PackageKit daemon itself.
 if have dnf; then
     run_step "dnf" -- dnf upgrade --refresh -y
 else
@@ -141,18 +177,20 @@ if have pkcon; then
     # (online), NOT as an offline/reboot update. pkcon reports "no updates" via
     # its output text rather than a stable exit code, so we decide from output.
     info "Updating PackageKit (pending packages, if any)..."
-    pk_out=$(LANG=C pkcon update -y -p 2>&1); pk_rc=$?
-    printf '%s\n' "$pk_out"
-    if [[ $pk_rc -eq 0 ]] || grep -qiE 'no (updates|packages)|nothing to do' <<<"$pk_out"; then
+    _pk_tmp=$(mktemp)
+    LANG=C pkcon update -y -p 2>&1 | tee "$_pk_tmp"; pk_rc=${PIPESTATUS[0]}
+    pk_out=$(<"$_pk_tmp"); rm -f "$_pk_tmp"
+    if [[ $pk_rc -eq 0 ]] || grep -qiE '(there are )?no (updates|packages)|nothing to do|updated 0 packages' <<<"$pk_out"; then
         ok "PackageKit update completed."
         RESULTS+=("OK   PackageKit (update)")
     else
         fail "PackageKit update failed (exit ${pk_rc})."
-        RESULTS+=("FAIL PackageKit (update, exit ${pk_rc})")
+        RESULTS+=("FAIL PackageKit (update) (exit ${pk_rc})")
     fi
 else
     warn "pkcon not found; skipping PackageKit/Discover sync."
-    RESULTS+=("SKIP PackageKit (not installed)")
+    RESULTS+=("SKIP PackageKit (refresh cache) (not installed)")
+    RESULTS+=("SKIP PackageKit (update) (not installed)")
 fi
 
 # 3. snap — Snap packages.
@@ -170,10 +208,12 @@ if have fwupdmgr; then
     OK_CODES=2 run_step "fwupd (refresh)" -- fwupdmgr refresh --force
     # Apply updates. Exit code 2 means "nothing to do" — treat as success.
     # Note: some firmware applies on next reboot rather than immediately.
+    # --assume-yes requires fwupd >= 1.3.0 (Fedora 30+)
     OK_CODES=2 run_step "fwupd (update)" -- fwupdmgr update --assume-yes
 else
     warn "fwupdmgr not found; skipping firmware update."
-    RESULTS+=("SKIP fwupd (not installed)")
+    RESULTS+=("SKIP fwupd (refresh) (not installed)")
+    RESULTS+=("SKIP fwupd (update) (not installed)")
 fi
 
 # --- summary ---------------------------------------------------------------
@@ -205,12 +245,17 @@ fi
 # stable across dnf4/dnf5, rather than the exit code. No `sudo` here: by this
 # point the script has already re-exec'd itself as root.
 echo
-if have dnf && dnf help needs-restarting &>/dev/null 2>&1; then
+# Probe using `--help` rather than `dnf help <subcommand>` because on dnf5
+# (Fedora 41+) the latter may exit non-zero even when the plugin is present.
+# grep patterns below match the stable output strings for both dnf4 and dnf5:
+#   dnf4: "Core libraries or services have been updated ... Reboot is required"
+#         "Reboot should not be necessary."
+#   dnf5: same phrasing is preserved in the needs-restarting plugin output.
+if have dnf && dnf needs-restarting --help &>/dev/null; then
     info "Checking whether a reboot is required..."
     reboot_out=$(LANG=C dnf needs-restarting --reboothint 2>&1)
     if grep -qi 'reboot is required' <<<"$reboot_out"; then
-        printf '%s%s*** REBOOT REQUIRED ***%s core packages were updated; reboot to apply them.\n' \
-            "$bold" "$yellow" "$reset"
+        alert "*** REBOOT REQUIRED *** core packages were updated; reboot to apply them."
     elif grep -qi 'reboot should not be necessary' <<<"$reboot_out"; then
         ok "No reboot required."
     else
