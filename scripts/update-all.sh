@@ -36,11 +36,19 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Runs a command, records the outcome, and reports it.
 # Optionally accept extra "success" exit codes (e.g. fwupd's "nothing to do")
 # by setting OK_CODES to a space-separated list before calling.
+#
+# OK_CODES convention: set it on the same line as the call (e.g. OK_CODES=2 run_step ...).
+# run_step reads it and immediately resets it to "" so it never leaks to the next call.
+# Do NOT call run_step from inside $() or a pipe: OK_CODES="" runs in the subshell and
+# does not propagate back, leaving a stale value that silently widens success-exit-codes.
+# OK_CODES must contain only space-separated numeric values (e.g. "2" or "2 3").
 run_step() {
     local label=$1
+    local code
     shift
     [[ "${1:-}" == "--" ]] && shift
 
+    local -a ok_codes
     read -ra ok_codes <<< "0 ${OK_CODES:-}"
     OK_CODES=""  # reset for the next call
 
@@ -71,6 +79,10 @@ run_step() {
 # --- identify the invoking (non-root) user ---------------------------------
 # Captured BEFORE we elevate, so we can run user-scope flatpak as them.
 INVOKING_USER="${SUDO_USER:-$USER}"
+if ! id -u "$INVOKING_USER" &>/dev/null; then
+    fail "SUDO_USER '${INVOKING_USER}' is not a valid user; aborting."
+    exit 1
+fi
 CURRENT_USER="$(id -un)"   # cached; always "root" after the privilege re-exec
 
 # as_user <command...> — run a command as the invoking user.
@@ -115,6 +127,14 @@ fi
 # Prevent concurrent invocations from racing on the RPM db lock,
 # the PackageKit daemon, or the fwupd daemon. Uses a non-blocking flock so
 # a second invocation fails immediately rather than hanging indefinitely.
+#
+# Note: this lock only serializes concurrent update-all runs. It does NOT
+# guard against external package managers (dnf-automatic.timer, packagekitd,
+# GNOME Software, snapd, fwupd) that may independently hold the RPM lock.
+if ! : 9>/run/update-all.lock 2>/dev/null; then
+    fail "Cannot create lock file /run/update-all.lock — check permissions/space."
+    exit 1
+fi
 exec 9>/run/update-all.lock
 flock -n 9 || { fail "Another update-all is already running."; exit 1; }
 
@@ -176,16 +196,27 @@ if have pkcon; then
     # Normally nothing, since dnf already upgraded everything. This runs LIVE
     # (online), NOT as an offline/reboot update. pkcon reports "no updates" via
     # its output text rather than a stable exit code, so we decide from output.
+    #
+    # Note: this update step runs regardless of the refresh outcome above (by
+    # design — pkcon may still have valid cached metadata even when the refresh
+    # step reports failure, so attempting the update is still worthwhile).
     info "Updating PackageKit (pending packages, if any)..."
-    _pk_tmp=$(mktemp)
-    LANG=C pkcon update -y -p 2>&1 | tee "$_pk_tmp"; pk_rc=${PIPESTATUS[0]}
-    pk_out=$(<"$_pk_tmp"); rm -f "$_pk_tmp"
-    if [[ $pk_rc -eq 0 ]] || grep -qiE '(there are )?no (updates|packages)|nothing to do|updated 0 packages' <<<"$pk_out"; then
+    pk_out=$(LANG=C pkcon update -y -p 2>&1); pk_rc=$?
+    printf '%s\n' "$pk_out"
+    # Pattern matches pkcon "nothing to do" messages (bare "no packages/updates"
+    # is intentionally omitted — it also matches error strings, causing false OKs):
+    #   nothing to update     — pkcon: no pending packages in cache
+    #   no updates available  — pkcon: cache shows nothing pending
+    #   updated 0 packages    — pkcon: transaction ran but installed nothing
+    #   nothing to do         — pkcon: generic "already current"
+    if [[ $pk_rc -eq 0 ]] || grep -qiE \
+        'nothing to update|no updates available|updated 0 packages|nothing to do' \
+        <<<"$pk_out"; then
         ok "PackageKit update completed."
         RESULTS+=("OK   PackageKit (update)")
     else
         fail "PackageKit update failed (exit ${pk_rc})."
-        RESULTS+=("FAIL PackageKit (update) (exit ${pk_rc})")
+        RESULTS+=("FAIL PackageKit (update, exit ${pk_rc})")
     fi
 else
     warn "pkcon not found; skipping PackageKit/Discover sync."
@@ -239,28 +270,25 @@ fi
 # ...) that are still running from before the update? Only RPM packages drive
 # an OS reboot, so this is a dnf check; flatpak/snap/firmware don't.
 #
-# Note: on dnf5 the `-r/--reboothint` flag is a no-op kept only for dnf4
-# compatibility -- plain `dnf needs-restarting` provides the hint. We still
-# pass the flag (harmless on both) but decide from the OUTPUT TEXT, which is
-# stable across dnf4/dnf5, rather than the exit code. No `sudo` here: by this
-# point the script has already re-exec'd itself as root.
+# We use `dnf needs-restarting -r` which exits 0 (no reboot needed) or 1
+# (reboot required). This is stable across dnf4 and dnf5. The `--reboothint`
+# flag existed in dnf4 but its presence on dnf5 is not guaranteed; `-r` is
+# the portable choice. No `sudo` here: by this point the script has already
+# re-exec'd itself as root.
 echo
 # Probe using `--help` rather than `dnf help <subcommand>` because on dnf5
 # (Fedora 41+) the latter may exit non-zero even when the plugin is present.
-# grep patterns below match the stable output strings for both dnf4 and dnf5:
-#   dnf4: "Core libraries or services have been updated ... Reboot is required"
-#         "Reboot should not be necessary."
-#   dnf5: same phrasing is preserved in the needs-restarting plugin output.
 if have dnf && dnf needs-restarting --help &>/dev/null; then
     info "Checking whether a reboot is required..."
-    reboot_out=$(LANG=C dnf needs-restarting --reboothint 2>&1)
-    if grep -qi 'reboot is required' <<<"$reboot_out"; then
-        alert "*** REBOOT REQUIRED *** core packages were updated; reboot to apply them."
-    elif grep -qi 'reboot should not be necessary' <<<"$reboot_out"; then
+    # `-r` exits 0 = no reboot needed, 1 = reboot required (dnf4 and dnf5).
+    dnf needs-restarting -r &>/dev/null
+    reboot_rc=$?
+    if [[ $reboot_rc -eq 0 ]]; then
         ok "No reboot required."
+    elif [[ $reboot_rc -eq 1 ]]; then
+        alert "*** REBOOT REQUIRED *** core packages were updated; reboot to apply them."
     else
-        warn "Could not determine reboot status; raw output below:"
-        printf '%s\n' "$reboot_out"
+        warn "Could not determine reboot status."
     fi
 else
     warn "dnf or needs-restarting plugin not found; skipping reboot check."
