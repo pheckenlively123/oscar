@@ -214,12 +214,14 @@ if have pkcon; then
     # Pattern matches pkcon "nothing to do" messages (bare "no packages/updates"
     # is intentionally omitted — it also matches error strings, causing false OKs;
     # "updated 0 packages" is likewise omitted — it appears in failure output too):
-    #   nothing to update     — pkcon: no pending packages in cache
-    #   no updates available  — pkcon: cache shows nothing pending
-    #   ^nothing to do$       — pkcon: generic "already current" (anchored to avoid
-    #                           matching error strings that contain this phrase)
+    #   nothing to update              — pkcon: no pending packages in cache
+    #   no updates available           — pkcon: cache shows nothing pending
+    #   ^nothing to do$                — pkcon: generic "already current" (anchored to avoid
+    #                                    matching error strings that contain this phrase)
+    #   no packages require updating   — pkcon + DNF5 backend (Fedora 41+): exits 5 despite
+    #                                    having nothing to install; match text to treat as OK
     if [[ $pk_rc -eq 0 ]] || grep -qiE \
-        'nothing to update|no updates available|^nothing to do$' \
+        'nothing to update|no updates available|^nothing to do$|no packages require updating' \
         <<<"$pk_out"; then
         ok "PackageKit update completed."
         RESULTS+=("OK   PackageKit (update)")
