@@ -225,6 +225,14 @@ if have pkcon; then
         <<<"$pk_out"; then
         ok "PackageKit update completed."
         RESULTS+=("OK   PackageKit (update)")
+    elif grep -qi 'timeout was reached' <<<"$pk_out"; then
+        # pkcon + DNF5 backend (Fedora 41+): the daemon finishes the transaction
+        # ("Status: Finished") but the D-Bus client times out waiting for the
+        # completion signal and exits 1 with "Command failed: Timeout was reached".
+        # dnf already applied all updates above, so this is a cosmetic D-Bus race,
+        # not a real failure — warn rather than fail so overall exit stays 0.
+        warn "PackageKit update timed out (D-Bus race with DNF5 backend) — dnf already applied all updates; Discover cache may lag until the next refresh."
+        RESULTS+=("SKIP PackageKit (update) (timeout)")
     else
         fail "PackageKit update failed (exit ${pk_rc})."
         RESULTS+=("FAIL PackageKit (update) (exit ${pk_rc})")
