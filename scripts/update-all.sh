@@ -28,6 +28,7 @@ alert() { printf '%s%s[ALRT]%s %s\n' "$bold" "$yellow" "$reset" "$*"; }
 
 # Track results for the final summary.
 declare -a RESULTS=()
+OK_CODES=""  # prevent caller-exported OK_CODES from contaminating the first run_step call
 
 # have <command> — true if a command exists on PATH.
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -78,7 +79,7 @@ run_step() {
 
 # --- identify the invoking (non-root) user ---------------------------------
 # Captured BEFORE we elevate, so we can run user-scope flatpak as them.
-INVOKING_USER="${SUDO_USER:-$USER}"
+INVOKING_USER="${SUDO_USER:-${USER:-root}}"
 if ! id -u "$INVOKING_USER" &>/dev/null; then
     fail "SUDO_USER '${INVOKING_USER}' is not a valid user; aborting."
     exit 1
@@ -101,11 +102,11 @@ as_user() {
 
 # --- privilege check -------------------------------------------------------
 # dnf, snap, and fwupd need root. Re-exec under sudo if not already root.
-SELF="$(realpath -- "$0")"
+SELF="$(realpath -- "$0")" || { fail "Cannot resolve script path for '$0'."; exit 1; }
 if [[ $EUID -ne 0 ]]; then
     if have sudo; then
         info "Elevating privileges with sudo (flatpak user-scope runs as you)..."
-        exec sudo --preserve-env=SUDO_USER bash "$SELF" "$@"
+        exec sudo /bin/bash "$SELF" "$@"
         # exec only returns on failure
         fail "exec sudo failed — check sudoers policy or sudo authentication."
         exit 1
@@ -127,15 +128,10 @@ fi
 # Prevent concurrent invocations from racing on the RPM db lock,
 # the PackageKit daemon, or the fwupd daemon. Uses a non-blocking flock so
 # a second invocation fails immediately rather than hanging indefinitely.
-#
-# Note: this lock only serializes concurrent update-all runs. It does NOT
-# guard against external package managers (dnf-automatic.timer, packagekitd,
-# GNOME Software, snapd, fwupd) that may independently hold the RPM lock.
-if ! : 9>/run/update-all.lock 2>/dev/null; then
-    fail "Cannot create lock file /run/update-all.lock — check permissions/space."
-    exit 1
-fi
-exec 9>/run/update-all.lock
+have flock || { fail "flock is not available; cannot guarantee single-instance execution."; exit 1; }
+# Only serializes concurrent update-all runs, not external package managers.
+exec 9>/run/update-all.lock 2>/dev/null \
+    || { fail "Cannot open lock file /run/update-all.lock — check permissions/space."; exit 1; }
 flock -n 9 || { fail "Another update-all is already running."; exit 1; }
 
 # --- direct root invocation warning ----------------------------------------
@@ -149,6 +145,14 @@ fi
 # --- the updates -----------------------------------------------------------
 
 # 1. Flatpak — apps and runtimes, both user and system scope.
+# Labels are defined once here so the skip-branch RESULTS entries stay in sync
+# with the run_step labels above — a single source of truth.
+FLATPAK_LABELS=(
+    "flatpak (user)"
+    "flatpak (system)"
+    "flatpak (remove unused, user)"
+    "flatpak (remove unused, system)"
+)
 if have flatpak; then
     # Per-user installation, run as the invoking user.
     run_step "flatpak (user)"   -- as_user flatpak update --user -y
@@ -159,7 +163,7 @@ if have flatpak; then
     run_step "flatpak (remove unused, system)" -- flatpak uninstall --system --unused -y
 else
     warn "flatpak not found; skipping flatpak update."
-    for label in "flatpak (user)" "flatpak (system)" "flatpak (remove unused, user)" "flatpak (remove unused, system)"; do
+    for label in "${FLATPAK_LABELS[@]}"; do
         RESULTS+=("SKIP ${label} (not installed)")
     done
 fi
@@ -201,22 +205,27 @@ if have pkcon; then
     # design — pkcon may still have valid cached metadata even when the refresh
     # step reports failure, so attempting the update is still worthwhile).
     info "Updating PackageKit (pending packages, if any)..."
-    pk_out=$(LANG=C pkcon update -y -p 2>&1); pk_rc=$?
+    # LC_ALL=C LANGUAGE= force English output; LANG=C alone does not override LC_ALL or
+    # LANGUAGE (GLib checks them first), so non-English locales would defeat the grep below.
+    # Note: -y is a non-interactive hint (suppress confirmation prompts); pkcon may
+    # silently ignore it if the installed version does not recognise this flag.
+    pk_out=$(LC_ALL=C LANGUAGE= pkcon update -y -p 2>&1); pk_rc=$?
     printf '%s\n' "$pk_out"
     # Pattern matches pkcon "nothing to do" messages (bare "no packages/updates"
-    # is intentionally omitted — it also matches error strings, causing false OKs):
+    # is intentionally omitted — it also matches error strings, causing false OKs;
+    # "updated 0 packages" is likewise omitted — it appears in failure output too):
     #   nothing to update     — pkcon: no pending packages in cache
     #   no updates available  — pkcon: cache shows nothing pending
-    #   updated 0 packages    — pkcon: transaction ran but installed nothing
-    #   nothing to do         — pkcon: generic "already current"
+    #   ^nothing to do$       — pkcon: generic "already current" (anchored to avoid
+    #                           matching error strings that contain this phrase)
     if [[ $pk_rc -eq 0 ]] || grep -qiE \
-        'nothing to update|no updates available|updated 0 packages|nothing to do' \
+        'nothing to update|no updates available|^nothing to do$' \
         <<<"$pk_out"; then
         ok "PackageKit update completed."
         RESULTS+=("OK   PackageKit (update)")
     else
         fail "PackageKit update failed (exit ${pk_rc})."
-        RESULTS+=("FAIL PackageKit (update, exit ${pk_rc})")
+        RESULTS+=("FAIL PackageKit (update) (exit ${pk_rc})")
     fi
 else
     warn "pkcon not found; skipping PackageKit/Discover sync."
@@ -255,7 +264,8 @@ for line in "${RESULTS[@]}"; do
     case "$line" in
         OK*)   ok   "$line" ;;
         SKIP*) warn "$line" ;;
-        *)     fail "$line"; overall=1 ;;
+        *)     [[ "$line" =~ ^FAIL ]] || warn "BUG: malformed RESULTS entry: $line"
+               fail "$line"; overall=1 ;;
     esac
 done
 
@@ -281,14 +291,14 @@ echo
 if have dnf && dnf needs-restarting --help &>/dev/null; then
     info "Checking whether a reboot is required..."
     # `-r` exits 0 = no reboot needed, 1 = reboot required (dnf4 and dnf5).
-    dnf needs-restarting -r &>/dev/null
-    reboot_rc=$?
+    reboot_out=$(dnf needs-restarting -r 2>&1); reboot_rc=$?
     if [[ $reboot_rc -eq 0 ]]; then
         ok "No reboot required."
     elif [[ $reboot_rc -eq 1 ]]; then
         alert "*** REBOOT REQUIRED *** core packages were updated; reboot to apply them."
     else
-        warn "Could not determine reboot status."
+        warn "Could not determine reboot status (exit ${reboot_rc})."
+        [[ -n "$reboot_out" ]] && warn "dnf output: ${reboot_out}"
     fi
 else
     warn "dnf or needs-restarting plugin not found; skipping reboot check."

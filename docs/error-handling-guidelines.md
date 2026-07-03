@@ -40,9 +40,15 @@ OK_CODES=2 run_step "fwupd (update)"  -- fwupdmgr update --assume-yes
 
 ```bash
 info "Updating PackageKit (pending packages, if any)..."
-pk_out=$(pkcon update -y -p 2>&1); pk_rc=$?
+# LC_ALL=C and LANGUAGE= are both required to force English output. LANG=C alone
+# does not override LC_ALL or LANGUAGE; GLib (used by pkcon) checks those first.
+# Without this, grep patterns fail on non-English systems.
+pk_out=$(LC_ALL=C LANGUAGE= pkcon update -y -p 2>&1); pk_rc=$?
 printf '%s\n' "$pk_out"
-if [[ $pk_rc -eq 0 ]] || grep -qiE 'no (updates|packages)|nothing to do' <<<"$pk_out"; then
+# Avoid 'no (updates|packages)' — it also matches error fragments, causing false OKs.
+# 'updated 0 packages' is likewise omitted — it can appear in failure output.
+# '^nothing to do$' is anchored to avoid matching error strings as a substring.
+if [[ $pk_rc -eq 0 ]] || grep -qiE 'nothing to update|no updates available|^nothing to do$' <<<"$pk_out"; then
     ok "PackageKit update completed."
     RESULTS+=("OK   PackageKit (update)")
 else
