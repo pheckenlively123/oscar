@@ -45,17 +45,33 @@ info "Updating PackageKit (pending packages, if any)..."
 # Without this, grep patterns fail on non-English systems.
 pk_out=$(LC_ALL=C LANGUAGE= pkcon update -y -p 2>&1); pk_rc=$?
 printf '%s\n' "$pk_out"
-# Avoid 'no (updates|packages)' — it also matches error fragments, causing false OKs.
-# 'updated 0 packages' is likewise omitted — it can appear in failure output.
-# '^nothing to do$' is anchored to avoid matching error strings as a substring.
-if [[ $pk_rc -eq 0 ]] || grep -qiE 'nothing to update|no updates available|^nothing to do$' <<<"$pk_out"; then
-    ok "PackageKit update completed."
-    RESULTS+=("OK   PackageKit (update)")
-else
-    fail "PackageKit update failed (exit ${pk_rc})."
-    RESULTS+=("FAIL PackageKit (update) (exit ${pk_rc})")
-fi
+case "$(pk_classify_result "$pk_rc" "$pk_out")" in
+    ok)
+        ok "PackageKit update completed."
+        RESULTS+=("OK   PackageKit (update)")
+        ;;
+    timeout)
+        ok "PackageKit update: D-Bus timeout (ignored — see pk_classify_result for why)."
+        RESULTS+=("OK   PackageKit (update) (D-Bus timeout, ignored)")
+        ;;
+    *)
+        fail "PackageKit update failed (exit ${pk_rc})."
+        RESULTS+=("FAIL PackageKit (update) (exit ${pk_rc})")
+        ;;
+esac
 ```
+
+When a tool's outcome has more than a simple ok/fail split — e.g. pkcon's "ok" / "known D-Bus-timeout quirk, treat as ok" / "genuine fail" — extract the classification into a small, pure `echo`-based function (`pk_classify_result`, alongside its `PK_NOTHING_TO_DO_PATTERN`, defined near `run_step`) instead of inlining the `grep` chain at each call site. This gives the selftest a single function to call directly with synthetic `rc`/`out` pairs, so the match pattern and the branching logic around it stay covered by one source of truth instead of a hand-copied duplicate that can silently drift.
+
+The current pattern matches these pkcon "nothing to do" messages:
+- `nothing to update` — no pending packages in cache
+- `no updates available` — cache shows nothing pending
+- `^nothing to do$` — generic "already current" (anchored to avoid matching error strings that contain the phrase as a substring)
+- `no packages require updating` — pkcon + DNF5 backend (Fedora 41+): exits 5 despite having nothing to install
+
+Avoid bare `'no (updates|packages)'` — it also matches error fragments, causing false OKs. `'updated 0 packages'` is likewise omitted — it can appear in failure output too.
+
+A separate `timeout` outcome (pkcon + DNF5 backend, Fedora 41+: the daemon finishes the transaction but the D-Bus client times out waiting for the completion signal, exiting 1 with "Command failed: Timeout was reached") is also classified as OK, since it's a cosmetic D-Bus race rather than a real failure — but reported with its own `(D-Bus timeout, ignored)` suffix in `RESULTS` so it's distinguishable from a plain success.
 
 When inlining, you are responsible for printing the banner, echoing captured output, and appending to `RESULTS` yourself — match `run_step`'s format.
 
