@@ -13,6 +13,12 @@
 set -u  # treat unset variables as errors; we intentionally do NOT use -e
         # because we want to keep going after a failed updater.
 
+# Pin PATH to a known-safe value so all tool lookups are predictable when
+# running as root regardless of the invoking user's PATH. All tools used by
+# this script (dnf, flatpak, pkcon, fwupdmgr, snap, flock, id, realpath,
+# tput, grep, bash) live in /usr/sbin or /usr/bin on Fedora.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
 # --- pretty output helpers -------------------------------------------------
 bold=$(tput bold 2>/dev/null || true)
 red=$(tput setaf 1 2>/dev/null || true)
@@ -53,10 +59,18 @@ run_step() {
     read -ra ok_codes <<< "0 ${OK_CODES:-}"
     OK_CODES=""  # reset for the next call
 
+    for code in "${ok_codes[@]}"; do
+        [[ "$code" =~ ^[0-9]+$ ]] || {
+            fail "run_step: invalid OK_CODES value '${code}' (not a non-negative integer)."
+            RESULTS+=("FAIL ${label} (invalid OK_CODES)")
+            return 1
+        }
+    done
+
     if [[ $# -eq 0 ]]; then
         # Defensive assertion — all call sites pass a command; this branch should not be reached.
         fail "run_step: '${label}' — no command specified."
-        RESULTS+=("FAIL ${label} (exit 1)")
+        RESULTS+=("FAIL ${label} (no command provided to run_step)")
         return 1
     fi
 
@@ -81,10 +95,12 @@ run_step() {
 # Captured BEFORE we elevate, so we can run user-scope flatpak as them.
 INVOKING_USER="${SUDO_USER:-${USER:-root}}"
 if ! id -u "$INVOKING_USER" &>/dev/null; then
-    fail "SUDO_USER '${INVOKING_USER}' is not a valid user; aborting."
+    fail "Invoking user '${INVOKING_USER}' (from \${SUDO_USER:-\${USER}}) is not a valid system user; aborting."
     exit 1
 fi
-CURRENT_USER="$(id -un)"   # cached; always "root" after the privilege re-exec
+CURRENT_USER="$(id -un)" \
+    || { fail "Cannot determine current user via id -un; aborting."; exit 1; }
+# CURRENT_USER is always "root" after the privilege re-exec
 
 # as_user <command...> — run a command as the invoking user.
 # Falls back to running directly if we're already that user.
@@ -93,12 +109,104 @@ CURRENT_USER="$(id -un)"   # cached; always "root" after the privilege re-exec
 # user-scope operations run as root — known limitation; see the warning
 # emitted after the privilege check for details.
 as_user() {
+    # The second condition ($CURRENT_USER == $INVOKING_USER) is dead code after the
+    # privilege re-exec (CURRENT_USER is always "root" then), but kept as a defensive
+    # fallback for non-re-exec contexts such as UPDATE_ALL_SELFTEST=1 mode.
     if [[ "$INVOKING_USER" == "root" || "$CURRENT_USER" == "$INVOKING_USER" ]]; then
         "$@"
     else
         sudo -Hu "$INVOKING_USER" "$@"
     fi
 }
+
+# --- selftest (UPDATE_ALL_SELFTEST=1) --------------------------------------
+# Exercises core logic without root. Usage:
+#   UPDATE_ALL_SELFTEST=1 bash scripts/update-all.sh
+# Lock-path parameterization can also be tested independently:
+#   UPDATE_ALL_LOCK_FILE=/tmp/update-all-test.lock bash scripts/update-all.sh
+if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
+    _st_pass=0 _st_fail=0
+
+    _assert() {
+        local desc="$1" want="$2" got="$3"
+        if [[ "$got" == "$want" ]]; then
+            ok  "SELFTEST PASS: ${desc}"
+            _st_pass=$(( _st_pass + 1 ))
+        else
+            fail "SELFTEST FAIL: ${desc}"
+            fail "  expected: '${want}'"
+            fail "  got:      '${got}'"
+            _st_fail=$(( _st_fail + 1 ))
+        fi
+    }
+
+    info "Running selftests..."
+
+    # H1: run_step exit 0 → OK result
+    RESULTS=()
+    run_step "test-ok" -- bash -c 'exit 0'
+    _assert "run_step(exit 0) → OK" "OK   test-ok" "${RESULTS[0]:-}"
+
+    # H1: run_step exit 1 → FAIL result
+    RESULTS=()
+    run_step "test-fail" -- bash -c 'exit 1'
+    _assert "run_step(exit 1) → FAIL" "FAIL test-fail (exit 1)" "${RESULTS[0]:-}"
+
+    # H1: OK_CODES extra code is accepted
+    RESULTS=()
+    OK_CODES=2 run_step "test-ok2" -- bash -c 'exit 2'
+    _assert "run_step(OK_CODES=2, exit 2) → OK" "OK   test-ok2" "${RESULTS[0]:-}"
+
+    # H1: OK_CODES resets between calls — must not leak to the next call
+    RESULTS=()
+    run_step "test-noleak" -- bash -c 'exit 2'
+    _assert "OK_CODES does not leak" "FAIL test-noleak (exit 2)" "${RESULTS[0]:-}"
+
+    # L2: non-numeric OK_CODES value is rejected before command runs
+    RESULTS=()
+    OK_CODES="abc" run_step "test-badcodes" -- bash -c 'exit 0'
+    _assert "invalid OK_CODES → FAIL" \
+        "FAIL test-badcodes (invalid OK_CODES)" "${RESULTS[0]:-}"
+
+    # L4: no-command branch emits the right RESULTS label
+    RESULTS=()
+    run_step "test-nocmd"
+    _assert "no-command → RESULTS label" \
+        "FAIL test-nocmd (no command provided to run_step)" "${RESULTS[0]:-}"
+
+    # H2: pkcon "nothing to do" grep pattern — strings that MUST match
+    _pk_pat='nothing to update|no updates available|^nothing to do$|no packages require updating'
+    for _s in \
+        "nothing to update" \
+        "No updates available" \
+        "Nothing to do" \
+        "no packages require updating"
+    do
+        if grep -qiE "$_pk_pat" <<<"$_s"; then
+            _assert "pkcon pattern matches: '${_s}'" "match" "match"
+        else
+            _assert "pkcon pattern matches: '${_s}'" "match" "no-match"
+        fi
+    done
+
+    # H2: strings that must NOT match the "nothing to do" pattern
+    for _s in \
+        "Command failed: Timeout was reached" \
+        "error: failed to connect" \
+        "no packages" \
+        "updated 0 packages"
+    do
+        if grep -qiE "$_pk_pat" <<<"$_s"; then
+            _assert "pkcon pattern does not match: '${_s}'" "no-match" "match"
+        else
+            _assert "pkcon pattern does not match: '${_s}'" "no-match" "no-match"
+        fi
+    done
+
+    echo
+    info "Selftest complete: ${_st_pass} passed, ${_st_fail} failed."
+    exit $(( _st_fail > 0 ? 1 : 0 ))
+fi
 
 # --- privilege check -------------------------------------------------------
 # dnf, snap, and fwupd need root. Re-exec under sudo if not already root.
@@ -130,8 +238,13 @@ fi
 # a second invocation fails immediately rather than hanging indefinitely.
 have flock || { fail "flock is not available; cannot guarantee single-instance execution."; exit 1; }
 # Only serializes concurrent update-all runs, not external package managers.
-exec 9>/run/update-all.lock 2>/dev/null \
-    || { fail "Cannot open lock file /run/update-all.lock — check permissions/space."; exit 1; }
+# The lock path is parameterizable so tests can override it without root.
+_LOCK_FILE="${UPDATE_ALL_LOCK_FILE:-/run/update-all.lock}"
+# Brace group limits the 2>/dev/null redirect to the exec alone, preserving
+# stderr for all subsequent commands (bare `exec 9>... 2>/dev/null` would
+# permanently close stderr for the entire rest of the script).
+{ exec 9>"$_LOCK_FILE"; } 2>/dev/null \
+    || { fail "Cannot open lock file ${_LOCK_FILE} — check permissions/space."; exit 1; }
 flock -n 9 || { fail "Another update-all is already running."; exit 1; }
 
 # --- direct root invocation warning ----------------------------------------
@@ -154,6 +267,7 @@ FLATPAK_LABELS=(
     "flatpak (remove unused, system)"
 )
 if have flatpak; then
+    # Labels below must match FLATPAK_LABELS above — two places, one source of truth.
     # Per-user installation, run as the invoking user.
     run_step "flatpak (user)"   -- as_user flatpak update --user -y
     # System-wide installation, run as root.
@@ -229,10 +343,11 @@ if have pkcon; then
         # pkcon + DNF5 backend (Fedora 41+): the daemon finishes the transaction
         # ("Status: Finished") but the D-Bus client times out waiting for the
         # completion signal and exits 1 with "Command failed: Timeout was reached".
-        # dnf already applied all updates above, so this is a cosmetic D-Bus race,
-        # not a real failure — warn rather than fail so overall exit stays 0.
-        warn "PackageKit update timed out (D-Bus race with DNF5 backend) — dnf already applied all updates; Discover cache may lag until the next refresh."
-        RESULTS+=("SKIP PackageKit (update) (timeout)")
+        # dnf already applied all updates above, so this is a cosmetic D-Bus race;
+        # classify as OK (not SKIP — the tool was present and ran) so the summary
+        # correctly distinguishes a D-Bus timeout from an absent pkcon installation.
+        ok "PackageKit update: D-Bus timeout (ignored — dnf already applied updates; Discover cache may lag)."
+        RESULTS+=("OK   PackageKit (update) (D-Bus timeout, ignored)")
     else
         fail "PackageKit update failed (exit ${pk_rc})."
         RESULTS+=("FAIL PackageKit (update) (exit ${pk_rc})")
@@ -296,22 +411,25 @@ fi
 # the portable choice. No `sudo` here: by this point the script has already
 # re-exec'd itself as root.
 echo
-# Probe using `--help` rather than `dnf help <subcommand>` because on dnf5
-# (Fedora 41+) the latter may exit non-zero even when the plugin is present.
-if have dnf && dnf needs-restarting --help &>/dev/null; then
+# Run needs-restarting -r directly; detect a missing plugin from the output
+# text rather than probing with `--help` first (avoids a redundant dnf startup).
+if have dnf; then
     info "Checking whether a reboot is required..."
-    # `-r` exits 0 = no reboot needed, 1 = reboot required (dnf4 and dnf5).
     reboot_out=$(dnf needs-restarting -r 2>&1); reboot_rc=$?
-    if [[ $reboot_rc -eq 0 ]]; then
+    # `-r` exits 0 = no reboot needed, 1 = reboot required (dnf4 and dnf5).
+    # Detect missing plugin by output text instead of a separate --help probe.
+    if grep -qi 'no such command\|unknown subcommand' <<<"$reboot_out"; then
+        warn "dnf needs-restarting plugin not found; skipping reboot check."
+    elif [[ $reboot_rc -eq 0 ]]; then
         ok "No reboot required."
     elif [[ $reboot_rc -eq 1 ]]; then
         alert "*** REBOOT REQUIRED *** core packages were updated; reboot to apply them."
+        # Print the package list so the operator can see what triggered the hint.
+        [[ -n "$reboot_out" ]] && printf '%s\n' "$reboot_out"
     else
         warn "Could not determine reboot status (exit ${reboot_rc})."
         [[ -n "$reboot_out" ]] && warn "dnf output: ${reboot_out}"
     fi
-else
-    warn "dnf or needs-restarting plugin not found; skipping reboot check."
 fi
 
 exit "$overall"
