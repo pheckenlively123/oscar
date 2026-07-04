@@ -53,7 +53,7 @@ if [[ $pk_rc -eq 0 ]] || grep -qiE 'nothing to update|no updates available|^noth
     RESULTS+=("OK   PackageKit (update)")
 else
     fail "PackageKit update failed (exit ${pk_rc})."
-    RESULTS+=("FAIL PackageKit (update, exit ${pk_rc})")
+    RESULTS+=("FAIL PackageKit (update) (exit ${pk_rc})")
 fi
 ```
 
@@ -100,4 +100,4 @@ Use `info`/`ok`/`warn`/`fail` for all user-facing messages — avoid raw `echo`/
 
 ## Privilege model
 
-The script re-execs itself under `sudo` (`exec sudo --preserve-env=SUDO_USER bash "$0" "$@"`) when not root, because dnf/snap/fwupd need root. `INVOKING_USER` is captured **before** elevation so user-scope work can drop back down via `as_user`. When adding a command that must run as the real user (e.g. `flatpak --user`), wrap it in `as_user`; everything else runs as root after the re-exec — do not add redundant `sudo` calls.
+The script re-execs itself under `sudo` (`exec sudo bash "$SELF" "$@"`, where `SELF` is the `realpath`-resolved script path) when not root, because dnf/snap/fwupd need root. `INVOKING_USER` is captured **before** elevation so user-scope work can drop back down via `as_user`. When adding a command that must run as the real user (e.g. `flatpak --user`), wrap it in `as_user`; everything else runs as root after the re-exec — do not add redundant `sudo` calls.
