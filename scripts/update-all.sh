@@ -119,16 +119,20 @@ run_step() {
 # appear embedded in other text, so anchoring only removes false-OK matches,
 # it doesn't weaken legitimate detection.
 #
-# CAVEAT (unverified against a real transcript): this assumes pkcon's real
-# stdout line is exactly the bare phrase with no leading/trailing text (e.g.
-# a "There are ..." prefix or trailing punctuation). If a captured
-# `LC_ALL=C LANGUAGE= pkcon update -y -p` transcript on a real dnf4- or
-# dnf5-backend system ever shows different wording, this pattern (or the
-# selftest fixtures exercising it) needs updating to match — since step 2b's
-# "nothing to do" is the normal, everyday outcome (dnf already did the real
-# work in step 2), a pattern that stops matching would turn routine
-# successful runs into a FAIL, not just miss a rare false-OK.
-readonly PK_NOTHING_TO_DO_PATTERN='^nothing to update$|^no updates available$|^nothing to do$|^no packages require updating$'
+# CAVEAT (partially verified): a real `pkcon update -y -p` transcript
+# (Fedora 44, aarch64, dnf5 backend) captured the "no packages require
+# updating" case as "No packages require updating to newer versions." —
+# NOT the bare phrase. The original bare-phrase-only anchor for that
+# alternative turned this routine, everyday "nothing to do" outcome into a
+# false FAIL (exit 5) in production, exactly as this caveat warned. That
+# alternative is now widened to accept the real trailing text below. The
+# other three alternatives ("nothing to update", "no updates available",
+# "nothing to do") remain unverified against a real transcript — if either
+# ever shows similar leading/trailing text in the wild, widen it the same
+# way. Since step 2b's "nothing to do" is the normal, everyday outcome (dnf
+# already did the real work in step 2), a pattern that stops matching turns
+# routine successful runs into a FAIL, not just misses a rare false-OK.
+readonly PK_NOTHING_TO_DO_PATTERN='^nothing to update$|^no updates available$|^nothing to do$|^no packages require updating( to newer versions)?\.?$'
 
 # pk_classify_result <rc> <output> — classify a `pkcon update` outcome from its
 # exit code and captured stdout/stderr text. Echoes exactly one of:
@@ -440,6 +444,11 @@ FAKESUDO
     _assert "pk_classify('Nothing to do') → ok" "ok" "$(pk_classify_result 1 'Nothing to do')"
     _assert "pk_classify('no packages require updating') → ok" "ok" \
         "$(pk_classify_result 5 'no packages require updating')"
+    # Real captured transcript (Fedora 44, aarch64, dnf5 backend, exit 5):
+    # pkcon's actual wording has trailing text the bare phrase alone didn't
+    # cover, which caused a real false FAIL in production before this fix.
+    _assert "pk_classify(real pkcon 'No packages require updating to newer versions.') → ok" "ok" \
+        "$(pk_classify_result 5 'No packages require updating to newer versions.')"
     _assert "pk_classify(D-Bus timeout text) → timeout" "timeout" \
         "$(pk_classify_result 1 'Command failed: Timeout was reached')"
     _assert "pk_classify(connection error) → fail" "fail" \
