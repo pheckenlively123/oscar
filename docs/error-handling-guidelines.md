@@ -21,6 +21,7 @@ Rules:
 - The literal `--` separator is optional but conventional — it visually divides the label from the command and is stripped if present.
 - Everything after is the command + args, run via `"$@"` (no `eval`, no quoting tricks). Pass real argv, not a string.
 - `run_step` returns the command's real `rc` on failure, `0` on success — but the script never branches on that return value; outcome flows through `RESULTS` instead.
+- A `label` is required. A call with an empty/missing label (unreachable from any current call site, but guarded defensively under `set -u`) degrades through `fail` + a distinct `RESULTS` line, `FAIL run_step (no label)` — note this does not follow the `FAIL <label> (exit <rc>)` shape used elsewhere, since there is no label to interpolate.
 
 ## `OK_CODES` — tolerating non-zero "success" exits
 
@@ -64,6 +65,8 @@ esac
 When a tool's outcome has more than a simple ok/fail split — e.g. pkcon's "ok" / "known D-Bus-timeout quirk, treat as ok" / "genuine fail" — extract the classification into a small, pure `echo`-based function (`pk_classify_result`, alongside its `PK_NOTHING_TO_DO_PATTERN`, defined near `run_step`) instead of inlining the `grep` chain at each call site. This gives the selftest a single function to call directly with synthetic `rc`/`out` pairs, so the match pattern and the branching logic around it stay covered by one source of truth instead of a hand-copied duplicate that can silently drift.
 
 The dnf `needs-restarting -r` reboot check (see the reboot-hint section near the end of the script) follows the same pattern via `classify_reboot_result <rc> <output>`: its 5-way split (missing plugin / no reboot / reboot required / ambiguous / unknown exit) is a pure function defined next to `pk_classify_result`, covered by its own selftest assertions for all 5 branches, rather than living only in the live call site's `if`/`elif` chain.
+
+Similarly, `pk_note_for <dnf_failed> <pk_refresh_failed>` (defined alongside `pk_classify_result`) builds the annotation suffix appended to the PackageKit (update) `RESULTS`/output line when an upstream step (the dnf upgrade or the PackageKit cache refresh) failed, so an apparent OK from step 2b isn't mistaken for a fully-verified post-upgrade sync. It is extracted the same way and for the same reason — the selftest covers all 4 `dnf_failed`/`pk_refresh_failed` flag combinations directly instead of only through the inline call site.
 
 The current pattern matches these pkcon "nothing to do" messages, each anchored to a whole line (`^...$`) to avoid matching error strings that contain the phrase as a substring:
 - `^nothing to update$` — no pending packages in cache
