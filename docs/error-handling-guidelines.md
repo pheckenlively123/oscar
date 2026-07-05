@@ -63,15 +63,19 @@ esac
 
 When a tool's outcome has more than a simple ok/fail split — e.g. pkcon's "ok" / "known D-Bus-timeout quirk, treat as ok" / "genuine fail" — extract the classification into a small, pure `echo`-based function (`pk_classify_result`, alongside its `PK_NOTHING_TO_DO_PATTERN`, defined near `run_step`) instead of inlining the `grep` chain at each call site. This gives the selftest a single function to call directly with synthetic `rc`/`out` pairs, so the match pattern and the branching logic around it stay covered by one source of truth instead of a hand-copied duplicate that can silently drift.
 
-The current pattern matches these pkcon "nothing to do" messages:
-- `nothing to update` — no pending packages in cache
-- `no updates available` — cache shows nothing pending
-- `^nothing to do$` — generic "already current" (anchored to avoid matching error strings that contain the phrase as a substring)
-- `no packages require updating` — pkcon + DNF5 backend (Fedora 41+): exits 5 despite having nothing to install
+The dnf `needs-restarting -r` reboot check (see the reboot-hint section near the end of the script) follows the same pattern via `classify_reboot_result <rc> <output>`: its 5-way split (missing plugin / no reboot / reboot required / ambiguous / unknown exit) is a pure function defined next to `pk_classify_result`, covered by its own selftest assertions for all 5 branches, rather than living only in the live call site's `if`/`elif` chain.
+
+The current pattern matches these pkcon "nothing to do" messages, each anchored to a whole line (`^...$`) to avoid matching error strings that contain the phrase as a substring:
+- `^nothing to update$` — no pending packages in cache
+- `^no updates available$` — cache shows nothing pending
+- `^nothing to do$` — generic "already current"
+- `^no packages require updating$` — pkcon + DNF5 backend (Fedora 41+): exits 5 despite having nothing to install
+
+All four alternatives are anchored, not just `nothing to do` — an unanchored substring match on any of them would reintroduce the same false-OK risk (a genuine error message that happens to contain one of these phrases would otherwise be misclassified as success).
 
 Avoid bare `'no (updates|packages)'` — it also matches error fragments, causing false OKs. `'updated 0 packages'` is likewise omitted — it can appear in failure output too.
 
-A separate `timeout` outcome (pkcon + DNF5 backend, Fedora 41+: the daemon finishes the transaction but the D-Bus client times out waiting for the completion signal, exiting 1 with "Command failed: Timeout was reached") is also classified as OK, since it's a cosmetic D-Bus race rather than a real failure — but reported with its own `(D-Bus timeout, ignored)` suffix in `RESULTS` so it's distinguishable from a plain success.
+A separate `timeout` outcome (pkcon + DNF5 backend, Fedora 41+: the daemon finishes the transaction but the D-Bus client times out waiting for the completion signal, exiting 1 with "Command failed: Timeout was reached") is also classified as OK, since it's a cosmetic D-Bus race rather than a real failure — but reported with its own `(D-Bus timeout, ignored)` suffix in `RESULTS` so it's distinguishable from a plain success. This classification requires BOTH `rc == 1` AND the fuller, specific message text (`"Command failed: Timeout was reached"`, not just `"timeout was reached"`) — the bare substring is also libcurl's stock text for `CURLE_OPERATION_TIMEDOUT`, so matching it alone (regardless of exit code) could misclassify a genuine network/repo timeout as this benign D-Bus race.
 
 When inlining, you are responsible for printing the banner, echoing captured output, and appending to `RESULTS` yourself — match `run_step`'s format.
 

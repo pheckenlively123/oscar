@@ -50,8 +50,16 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # does not propagate back, leaving a stale value that silently widens success-exit-codes.
 # OK_CODES must contain only space-separated numeric values (e.g. "2" or "2 3").
 run_step() {
-    local label=$1
+    # ${1:-} (not $1) because under set -u a hypothetical future zero-argument
+    # call would otherwise hard-abort the whole script with "unbound
+    # variable" instead of degrading through the FAIL/RESULTS path below.
+    local label=${1:-}
     local code
+    if [[ -z "$label" ]]; then
+        fail "run_step: called with no label."
+        RESULTS+=("FAIL run_step (no label)")
+        return 1
+    fi
     shift
     [[ "${1:-}" == "--" ]] && shift
 
@@ -97,9 +105,12 @@ run_step() {
 #
 # Pattern deliberately narrow: bare "no packages"/"no updates" and "updated 0
 # packages" are excluded because they also appear inside pkcon's failure/error
-# output, which would cause false OKs. "^nothing to do$" is anchored for the
-# same reason.
-readonly PK_NOTHING_TO_DO_PATTERN='nothing to update|no updates available|^nothing to do$|no packages require updating'
+# output, which would cause false OKs. Every alternative is anchored to a
+# whole line (^...$) for the same reason — these are known standalone pkcon
+# messages (see docs/error-handling-guidelines.md), not fragments expected to
+# appear embedded in other text, so anchoring only removes false-OK matches,
+# it doesn't weaken legitimate detection.
+readonly PK_NOTHING_TO_DO_PATTERN='^nothing to update$|^no updates available$|^nothing to do$|^no packages require updating$'
 
 # pk_classify_result <rc> <output> — classify a `pkcon update` outcome from its
 # exit code and captured stdout/stderr text. Echoes exactly one of:
@@ -113,10 +124,63 @@ pk_classify_result() {
     local rc=$1 out=$2
     if [[ $rc -eq 0 ]] || grep -qiE "$PK_NOTHING_TO_DO_PATTERN" <<<"$out"; then
         echo "ok"
-    elif grep -qi 'timeout was reached' <<<"$out"; then
+    # Restricted to rc == 1 and the fuller, specific message: the bare
+    # substring "timeout was reached" is also libcurl's stock text for
+    # CURLE_OPERATION_TIMEDOUT, so a genuine network/repo timeout during the
+    # update could otherwise be misclassified as the benign D-Bus race and
+    # silently hide a real failure.
+    elif [[ $rc -eq 1 ]] && grep -qi 'Command failed: Timeout was reached' <<<"$out"; then
         echo "timeout"
     else
         echo "fail"
+    fi
+}
+
+# pk_note_for <dnf_failed> <pk_refresh_failed> — builds the annotation suffix
+# appended to the PackageKit (update) RESULTS/output line when an upstream
+# step (the dnf upgrade or the PackageKit cache refresh) failed, so an
+# apparent OK here isn't mistaken for a fully-verified post-upgrade sync.
+# Extracted (like pk_classify_result) so the selftest can cover all 4 flag
+# combinations directly instead of only via the inline call site.
+pk_note_for() {
+    local dnf_failed=$1 pk_refresh_failed=$2
+    local note=""
+    [[ "$dnf_failed" -eq 1 ]] && note+=" (dnf upgrade failed — sync may run against a non-post-upgrade state)"
+    [[ "$pk_refresh_failed" -eq 1 ]] && note+=" (cache refresh failed — result unverified)"
+    echo "$note"
+}
+
+# classify_reboot_result <rc> <output> — classify a `dnf needs-restarting -r`
+# outcome from its exit code and captured stdout/stderr text. Echoes exactly
+# one of:
+#   no_plugin       — the needs-restarting plugin/subcommand isn't available
+#                     (dnf4 "no such command"/"unknown subcommand" wording, or
+#                     dnf5's "unknown argument ... for command" wording)
+#   no_reboot       — rc 0: no reboot needed
+#   reboot_required — rc 1 and the output looks like a real triggering-package
+#                     list, not an error
+#   ambiguous       — rc 1 but the output is empty or looks like an error
+#                     instead of a package list (dnf's generic failure exit
+#                     code is ALSO 1 — broken repo metadata, RPM db lock,
+#                     network failure, ... — so rc alone isn't trustworthy)
+#   unknown         — any other exit code
+# Extracted (like pk_classify_result) so this 5-branch classification — the
+# same shape of problem pk_classify_result was extracted to solve — gets its
+# own selftest coverage instead of living only in the live call site.
+classify_reboot_result() {
+    local rc=$1 out=$2
+    if grep -qiE 'no such command|unknown subcommand|unknown argument' <<<"$out"; then
+        echo "no_plugin"
+    elif [[ $rc -eq 0 ]]; then
+        echo "no_reboot"
+    elif [[ $rc -eq 1 ]]; then
+        if [[ -z "$out" ]] || grep -qi 'error' <<<"$out"; then
+            echo "ambiguous"
+        else
+            echo "reboot_required"
+        fi
+    else
+        echo "unknown"
     fi
 }
 
@@ -163,9 +227,35 @@ as_user() {
 # --- selftest (UPDATE_ALL_SELFTEST=1) --------------------------------------
 # Exercises core logic without root. Usage:
 #   UPDATE_ALL_SELFTEST=1 bash scripts/update-all.sh
-# Lock-path parameterization can also be tested independently:
-#   UPDATE_ALL_LOCK_FILE=/tmp/update-all-test.lock bash scripts/update-all.sh
+# UPDATE_ALL_LOCK_FILE parameterizes the mutual-exclusion guard's path so it
+# doesn't have to touch the real /run/update-all.lock, but this does NOT
+# bypass the privilege check above: run as an unprivileged user, invocation
+# still stops at "needs root" before ever reaching the lock guard, same as
+# any other run. It only becomes useful once already root/sudo, e.g.:
+#   sudo UPDATE_ALL_LOCK_FILE=/tmp/update-all-test.lock bash scripts/update-all.sh
+#
+# Known gap: the sudo re-exec itself, the "have sudo" false branch, the "exec
+# sudo failed" fallback, the "have flock" false branch, and the
+# direct-root-invocation warning are entry-point/privilege paths that cannot
+# be exercised without root — an inherent limitation of testing a
+# root-requiring script unprivileged, not an oversight.
 if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
+    # Internal recursion hook for the OK_CODES anti-contamination test below:
+    # when set, run ONLY that check against a genuinely fresh process (so the
+    # real top-level "OK_CODES=\"\"" guard near the top of this file runs for
+    # real) and exit, instead of the full suite — this avoids infinitely
+    # recursing into the full selftest.
+    if [[ "${_UPDATE_ALL_ENVGUARD_PROBE:-}" == "1" ]]; then
+        RESULTS=()
+        # Suppress run_step's own banner/status output (it prints to stdout)
+        # so the parent's command substitution captures only the RESULTS
+        # line printed below, not the interleaved "==> Updating..."/"[FAIL]"
+        # text.
+        run_step "test-envguard" -- bash -c 'exit 1' >/dev/null 2>&1
+        printf '%s\n' "${RESULTS[0]:-}"
+        exit 0
+    fi
+
     _st_pass=0 _st_fail=0
 
     _assert() {
@@ -188,13 +278,19 @@ if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
     _assert "have rejects a nonexistent command" "no" \
         "$(have this-command-does-not-exist-xyz123 && echo yes || echo no)"
 
-    # L14: a pre-existing (e.g. caller-exported) OK_CODES must not contaminate
-    # the very first run_step call.
-    RESULTS=()
-    OK_CODES="99"
-    run_step "test-envguard" -- bash -c 'exit 1'
+    # L14: a stale/exported OK_CODES from the CALLING shell — i.e. present
+    # BEFORE this script's own top-level "OK_CODES=\"\"" guard runs — must
+    # not leak into the first run_step call. Setting OK_CODES in *this* shell
+    # immediately before the call (the previous version of this test) can't
+    # exercise that guard: by this point the guard already ran once, so the
+    # test was indistinguishable from ordinary same-line OK_CODES usage — and
+    # a value that doesn't match the exit code (99 vs exit 1) passes whether
+    # or not the guard exists at all. Instead, export OK_CODES=1 (which WOULD
+    # match the command's exit code if it leaked through) into a genuinely
+    # fresh process of this same script and let its own guard run for real.
+    _envguard_got="$(OK_CODES=1 _UPDATE_ALL_ENVGUARD_PROBE=1 UPDATE_ALL_SELFTEST=1 bash "$0")"
     _assert "stale/exported OK_CODES doesn't leak into first call" \
-        "FAIL test-envguard (exit 1)" "${RESULTS[0]:-}"
+        "FAIL test-envguard (exit 1)" "$_envguard_got"
 
     # H1: run_step exit 0 → OK result
     RESULTS=()
@@ -237,16 +333,19 @@ if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
     OK_CODES="-1" run_step "test-badcodes-neg" -- bash -c 'exit 0'
     _assert "invalid OK_CODES (negative) → FAIL" \
         "FAIL test-badcodes-neg (invalid OK_CODES)" "${RESULTS[0]:-}"
+    _assert "invalid OK_CODES (negative) → exactly one RESULTS entry" "1" "${#RESULTS[@]}"
 
     RESULTS=()
     OK_CODES="2.5" run_step "test-badcodes-decimal" -- bash -c 'exit 0'
     _assert "invalid OK_CODES (decimal) → FAIL" \
         "FAIL test-badcodes-decimal (invalid OK_CODES)" "${RESULTS[0]:-}"
+    _assert "invalid OK_CODES (decimal) → exactly one RESULTS entry" "1" "${#RESULTS[@]}"
 
     RESULTS=()
     OK_CODES="2 abc" run_step "test-badcodes-mixed" -- bash -c 'exit 0'
     _assert "invalid OK_CODES (mixed valid/invalid) → FAIL" \
         "FAIL test-badcodes-mixed (invalid OK_CODES)" "${RESULTS[0]:-}"
+    _assert "invalid OK_CODES (mixed valid/invalid) → exactly one RESULTS entry" "1" "${#RESULTS[@]}"
 
     # L4: no-command branch emits the right RESULTS label
     RESULTS=()
@@ -259,6 +358,25 @@ if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
     # normal (non-sudo) selftest invocation, where INVOKING_USER is either the
     # current user or "root" (see the as_user fallback comment above).
     _assert "as_user runs directly for the current user" "$CURRENT_USER" "$(as_user id -un)"
+
+    # M6: the `sudo -n -Hu ...` branch was previously only reachable by
+    # happenstance (whether INVOKING_USER == CURRENT_USER held in the test
+    # environment) — never deterministically exercised. Force that branch by
+    # setting CURRENT_USER/INVOKING_USER to differ, and fake a `sudo` on PATH
+    # (safe: it only echoes its argv, never actually elevates or runs
+    # anything) so we can assert exactly how as_user invokes it. Restoring
+    # CURRENT_USER/INVOKING_USER isn't needed — the selftest exits right
+    # after this block completes.
+    _fake_sudo_dir="$(mktemp -d)"
+    cat > "${_fake_sudo_dir}/sudo" <<'FAKESUDO'
+#!/usr/bin/env bash
+printf 'sudo-called: %s\n' "$*"
+FAKESUDO
+    chmod +x "${_fake_sudo_dir}/sudo"
+    _as_user_sudo_got="$(PATH="${_fake_sudo_dir}:${PATH}" CURRENT_USER="root" INVOKING_USER="nobody" as_user id -un)"
+    _assert "as_user invokes 'sudo -n -Hu <user>' when CURRENT_USER != INVOKING_USER" \
+        "sudo-called: -n -Hu nobody id -un" "$_as_user_sudo_got"
+    rm -rf "${_fake_sudo_dir}"
 
     # H2/H3: pk_classify_result is the single source of truth shared with the
     # live PackageKit step (2b) below — exercise all three outcomes end-to-end
@@ -277,11 +395,70 @@ if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
     _assert "pk_classify('updated 0 packages') → fail" "fail" \
         "$(pk_classify_result 1 'updated 0 packages')"
 
+    # M2/M3: every PK_NOTHING_TO_DO_PATTERN alternative is anchored to a whole
+    # line — a "nothing to do"-class phrase embedded inside a longer error
+    # line must NOT be classified as ok. Previously only "nothing to do"
+    # itself was anchored; the other three were unanchored substrings with
+    # the same false-OK collision risk (High finding #1's class of bug).
+    _assert "pk_classify('Error: nothing to do, aborting') → fail" "fail" \
+        "$(pk_classify_result 1 'Error: nothing to do, aborting')"
+    _assert "pk_classify('nothing to update' embedded in error) → fail" "fail" \
+        "$(pk_classify_result 1 'Error: nothing to update, repo unreachable')"
+    _assert "pk_classify('no updates available' embedded in error) → fail" "fail" \
+        "$(pk_classify_result 1 'Warning: no updates available, connection reset')"
+    _assert "pk_classify('no packages require updating' embedded in error) → fail" "fail" \
+        "$(pk_classify_result 1 'no packages require updating: transaction aborted')"
+
+    # H1: the "timeout" outcome requires BOTH rc==1 AND the specific message.
+    # Confirm the rc gate actually matters: the exact message text with a
+    # non-1 rc (e.g. a genuine network-layer timeout surfacing as some other
+    # exit code) must fail, not be swallowed as the benign D-Bus race.
+    _assert "pk_classify(exact timeout text, wrong rc) → fail" "fail" \
+        "$(pk_classify_result 28 'Command failed: Timeout was reached')"
+    # And confirm the bare substring "timeout was reached" alone (without the
+    # "Command failed:" prefix — e.g. libcurl's CURLE_OPERATION_TIMEDOUT text)
+    # no longer matches even at rc=1, since it's not the specific message.
+    _assert "pk_classify(bare 'timeout was reached' substring) → fail" "fail" \
+        "$(pk_classify_result 1 'curl: (28) Operation timeout was reached')"
+
+    # M4: pk_note_for covers all 4 dnf_failed/pk_refresh_failed combinations —
+    # extracted (like pk_classify_result) so each is independently testable.
+    _assert "pk_note_for(0,0) → no annotation" "" "$(pk_note_for 0 0)"
+    _assert "pk_note_for(1,0) → dnf-failed annotation" \
+        " (dnf upgrade failed — sync may run against a non-post-upgrade state)" "$(pk_note_for 1 0)"
+    _assert "pk_note_for(0,1) → refresh-failed annotation" \
+        " (cache refresh failed — result unverified)" "$(pk_note_for 0 1)"
+    _assert "pk_note_for(1,1) → both annotations" \
+        " (dnf upgrade failed — sync may run against a non-post-upgrade state) (cache refresh failed — result unverified)" \
+        "$(pk_note_for 1 1)"
+
+    # H4: classify_reboot_result covers all 5 branches (previously zero
+    # selftest coverage despite being the same shape of problem
+    # pk_classify_result was extracted to solve).
+    _assert "classify_reboot(dnf4 'no such command') → no_plugin" "no_plugin" \
+        "$(classify_reboot_result 1 'No such command: needs-restarting')"
+    _assert "classify_reboot(dnf5 'unknown argument') → no_plugin" "no_plugin" \
+        "$(classify_reboot_result 2 'Unknown argument "needs-restarting" for command "dnf5".')"
+    _assert "classify_reboot(rc=0) → no_reboot" "no_reboot" "$(classify_reboot_result 0 '')"
+    _assert "classify_reboot(rc=1, package list) → reboot_required" "reboot_required" \
+        "$(classify_reboot_result 1 'kernel-6.9.0-1.fc41.x86_64')"
+    _assert "classify_reboot(rc=1, empty output) → ambiguous" "ambiguous" \
+        "$(classify_reboot_result 1 '')"
+    _assert "classify_reboot(rc=1, error output) → ambiguous" "ambiguous" \
+        "$(classify_reboot_result 1 'Error: repository metadata failed to load')"
+    _assert "classify_reboot(rc=3, unexpected) → unknown" "unknown" \
+        "$(classify_reboot_result 3 'weird output')"
+
     # L11: the flock mechanism actually serializes — a second non-blocking
     # flock against an already-held lock must fail immediately. Exercises the
     # same primitive as the mutual-exclusion guard below, without needing root
     # or the real /run/update-all.lock path.
-    _lock_test_file="$(mktemp -u)"
+    # Plain mktemp (not `mktemp -u`), which creates the file atomically —
+    # `-u` only reserves a filename without creating it, a TOCTOU-prone
+    # pattern (a symlink/file could be planted at that path before the exec
+    # below opens it). Low impact here (unprivileged selftest-only code) but
+    # inconsistent with the care taken elsewhere in the script.
+    _lock_test_file="$(mktemp)"
     { exec 8>"$_lock_test_file"; } 2>/dev/null
     if flock -n 8; then
         { exec 7>"$_lock_test_file"; } 2>/dev/null
@@ -355,8 +532,18 @@ _LOCK_FILE="${UPDATE_ALL_LOCK_FILE:-/run/update-all.lock}"
 # run via run_step (dnf, flatpak, pkcon, snap, fwupdmgr). None of those are
 # expected to background/daemonize themselves while holding it; if one ever
 # does, the lock would outlive this script and wrongly reject the next run.
-{ exec 9>"$_LOCK_FILE"; } 2>/dev/null \
-    || { fail "Cannot open lock file ${_LOCK_FILE} — check permissions/space."; exit 1; }
+# stderr is captured to a temp file (rather than a variable via $(...))
+# because `exec 9>...` must run in THIS shell, not a subshell, for fd 9 to
+# stay open for the flock call below — command substitution would open it
+# in a subshell that exits immediately, closing the fd before flock ever runs.
+_lock_err_file="$(mktemp)"
+if ! { exec 9>"$_LOCK_FILE"; } 2>"$_lock_err_file"; then
+    _lock_err="$(cat "$_lock_err_file" 2>/dev/null)"
+    rm -f "$_lock_err_file"
+    fail "Cannot open lock file ${_LOCK_FILE}: ${_lock_err:-unknown error (check permissions/space)}"
+    exit 1
+fi
+rm -f "$_lock_err_file"
 flock -n 9 || { fail "Another update-all is already running."; exit 1; }
 
 # --- direct root invocation warning ----------------------------------------
@@ -370,8 +557,10 @@ fi
 # --- the updates -----------------------------------------------------------
 
 # 1. Flatpak — apps and runtimes, both user and system scope.
-# Labels are defined once here so the skip-branch RESULTS entries stay in sync
-# with the run_step labels above — a single source of truth.
+# Labels are defined once here and referenced by index below, both in the
+# run_step calls AND the skip-branch RESULTS entries, so there is exactly one
+# place a label can be edited — a rename can no longer drift the two branches
+# out of sync (previously they were hand-duplicated strings in two places).
 FLATPAK_LABELS=(
     "flatpak (user)"
     "flatpak (system)"
@@ -379,14 +568,13 @@ FLATPAK_LABELS=(
     "flatpak (remove unused, system)"
 )
 if have flatpak; then
-    # Labels below must match FLATPAK_LABELS above — two places, one source of truth.
     # Per-user installation, run as the invoking user.
-    run_step "flatpak (user)"   -- as_user flatpak update --user -y
+    run_step "${FLATPAK_LABELS[0]}" -- as_user flatpak update --user -y
     # System-wide installation, run as root.
-    run_step "flatpak (system)" -- flatpak update --system -y
+    run_step "${FLATPAK_LABELS[1]}" -- flatpak update --system -y
     # Clean up runtimes no longer needed by any app (both scopes).
-    run_step "flatpak (remove unused, user)"   -- as_user flatpak uninstall --user --unused -y
-    run_step "flatpak (remove unused, system)" -- flatpak uninstall --system --unused -y
+    run_step "${FLATPAK_LABELS[2]}" -- as_user flatpak uninstall --user --unused -y
+    run_step "${FLATPAK_LABELS[3]}" -- flatpak uninstall --system --unused -y
 else
     warn "flatpak not found; skipping flatpak update."
     for label in "${FLATPAK_LABELS[@]}"; do
@@ -447,9 +635,9 @@ if have pkcon; then
     pk_out=$(LC_ALL=C LANGUAGE= pkcon update -y -p 2>&1); pk_rc=$?
     printf '%s\n' "$pk_out"
 
-    pk_note=""
-    [[ $dnf_failed -eq 1 ]] && pk_note+=" (dnf upgrade failed — sync may run against a non-post-upgrade state)"
-    [[ $pk_refresh_failed -eq 1 ]] && pk_note+=" (cache refresh failed — result unverified)"
+    # pk_note_for (defined near run_step, shared with the selftest) is the
+    # single source of truth for this annotation logic.
+    pk_note="$(pk_note_for "$dnf_failed" "$pk_refresh_failed")"
 
     # pk_classify_result (defined near run_step, shared with the selftest) is
     # the single source of truth for the "nothing to do"/timeout/fail pattern
@@ -535,30 +723,41 @@ echo
 # text rather than probing with `--help` first (avoids a redundant dnf startup).
 if have dnf; then
     info "Checking whether a reboot is required..."
-    reboot_out=$(dnf needs-restarting -r 2>&1); reboot_rc=$?
-    # `-r` exits 0 = no reboot needed, 1 = reboot required (dnf4 and dnf5).
-    # Detect missing plugin by output text instead of a separate --help probe.
-    if grep -qi 'no such command\|unknown subcommand' <<<"$reboot_out"; then
-        warn "dnf needs-restarting plugin not found; skipping reboot check."
-    elif [[ $reboot_rc -eq 0 ]]; then
-        ok "No reboot required."
-    elif [[ $reboot_rc -eq 1 ]]; then
-        # dnf's generic failure exit code is ALSO 1 (broken repo metadata, RPM
-        # db lock, network failure, ...) — don't trust the exit code alone.
-        # Sanity-check the output actually looks like a triggering package
-        # list rather than an error, before declaring a reboot required.
-        if [[ -z "$reboot_out" ]] || grep -qi 'error' <<<"$reboot_out"; then
-            warn "dnf needs-restarting exited 1, but the output doesn't look like a package list — reboot status is ambiguous (the check itself may have failed). Review output below."
-            [[ -n "$reboot_out" ]] && warn "dnf output: ${reboot_out}"
-        else
+    # LC_ALL=C LANGUAGE= force English output, same as the pkcon call above
+    # (2b) and for the same reason: a non-English locale would defeat the
+    # grep-based classification below (missing-plugin detection, and the
+    # ambiguous-vs-required "error" sanity check), risking a false
+    # "*** REBOOT REQUIRED ***" alert on a genuinely unrelated dnf error.
+    reboot_out=$(LC_ALL=C LANGUAGE= dnf needs-restarting -r 2>&1); reboot_rc=$?
+    # classify_reboot_result (defined near run_step, shared with the
+    # selftest) is the single source of truth for this 5-branch
+    # classification — `-r` exits 0 (no reboot needed) or 1 (reboot
+    # required), stable across dnf4 and dnf5, but dnf's generic failure exit
+    # code is ALSO 1, and the missing-plugin wording differs between dnf4
+    # ("no such command"/"unknown subcommand") and dnf5 ("unknown argument
+    # ... for command"), so both text-based checks matter more than the raw
+    # exit code alone.
+    case "$(classify_reboot_result "$reboot_rc" "$reboot_out")" in
+        no_plugin)
+            warn "dnf needs-restarting plugin not found; skipping reboot check."
+            ;;
+        no_reboot)
+            ok "No reboot required."
+            ;;
+        reboot_required)
             alert "*** REBOOT REQUIRED *** core packages were updated; reboot to apply them."
             # Print the package list so the operator can see what triggered the hint.
             printf '%s\n' "$reboot_out"
-        fi
-    else
-        warn "Could not determine reboot status (exit ${reboot_rc})."
-        [[ -n "$reboot_out" ]] && warn "dnf output: ${reboot_out}"
-    fi
+            ;;
+        ambiguous)
+            warn "dnf needs-restarting exited 1, but the output doesn't look like a package list — reboot status is ambiguous (the check itself may have failed). Review output below."
+            [[ -n "$reboot_out" ]] && warn "dnf output: ${reboot_out}"
+            ;;
+        unknown)
+            warn "Could not determine reboot status (exit ${reboot_rc})."
+            [[ -n "$reboot_out" ]] && warn "dnf output: ${reboot_out}"
+            ;;
+    esac
 fi
 
 exit "$overall"
