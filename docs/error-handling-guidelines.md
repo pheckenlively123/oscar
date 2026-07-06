@@ -1,6 +1,6 @@
 # Error Handling Guidelines
 
-These rules govern error handling in `scripts/update-all.sh` and any updater added to it. They encode conventions specific to this repo; follow them exactly.
+These rules govern error handling in `scripts/update-all-fedora.sh` and `scripts/update-all-ubuntu.sh`, and any updater added to them. They encode conventions specific to this repo; follow them exactly. Examples below quote the Fedora script; the Ubuntu script follows the same contract (with `apt` in place of `dnf`, and `classify_reboot_marker` — the `/run/reboot-required` three-way classifier — in place of `classify_reboot_result`).
 
 ## Core philosophy: `set -u`, never `set -e`
 
