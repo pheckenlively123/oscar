@@ -22,8 +22,9 @@ set -u  # treat unset variables as errors; we intentionally do NOT use -e
 
 # Pin PATH to a known-safe value so all tool lookups are predictable when
 # running as root regardless of the invoking user's PATH. All tools used by
-# this script (apt-get, flatpak, pkcon, fwupdmgr, snap, dpkg-query, flock,
-# id, realpath, tput, grep, bash) live in /usr/sbin or /usr/bin on Ubuntu.
+# this script (apt-get, flatpak, pkcon, fwupdmgr, snap, dpkg-query, env,
+# flock, id, realpath, tput, grep, bash) live in /usr/sbin or /usr/bin on
+# Ubuntu.
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 # --- pretty output helpers -------------------------------------------------
@@ -186,11 +187,14 @@ pk_note_for() {
 # /run/reboot-required marker file exists, and whether update-notifier-common
 # (the package whose dpkg hooks CREATE that marker) is installed. Echoes
 # exactly one of:
-#   reboot_required — the marker exists; a package postinst requested a reboot
+#   reboot_required — the marker exists; a package postinst (or fwupd, which
+#                     writes the same marker when firmware is staged to apply
+#                     on reboot) requested a reboot
 #   no_reboot       — no marker, and the machinery that would have written one
 #                     is present, so its absence is meaningful
 #   unknown         — no marker, but update-notifier-common isn't installed:
-#                     the marker is NEVER created on this system, so "absent"
+#                     deb updates never create the marker on this system
+#                     (only fwupd would), so "absent"
 #                     carries no information — reporting "no reboot" here
 #                     would be a silent false negative after every kernel
 #                     update
@@ -816,13 +820,30 @@ fi
 
 # 4. fwupd — firmware (BIOS/UEFI, SSDs, docks, peripherals via LVFS).
 if have fwupdmgr; then
+    # env -u DISPLAY -u XAUTHORITY: DISPLAY often survives into the root
+    # environment (sudoers env_keep, SSH X11 forwarding) while the matching
+    # XAUTHORITY cookie does not, so fwupdmgr's display probe fails with a
+    # noisy "X11 connection rejected because of wrong authentication." line
+    # interleaved with its real output (observed on Ubuntu 24.04). fwupdmgr
+    # needs no display; unset both so its output stays clean.
+    #
     # Refresh metadata. --force avoids the "refreshed too recently" error.
     # Exit code 2 means "metadata already current" — treat as success.
-    OK_CODES=2 run_step "fwupd (refresh)" -- fwupdmgr refresh --force
+    OK_CODES=2 run_step "fwupd (refresh)" -- env -u DISPLAY -u XAUTHORITY fwupdmgr refresh --force
     # Apply updates. Exit code 2 means "nothing to do" — treat as success.
     # Note: some firmware applies on next reboot rather than immediately.
     # --assume-yes requires fwupd >= 1.3.0 (Ubuntu 20.04+)
-    OK_CODES=2 run_step "fwupd (update)" -- fwupdmgr update --assume-yes
+    #
+    # Known failure mode (observed 2026-07, Ubuntu 24.04): exits 1 with
+    # "Blocked executable in the ESP, ensure grub and shim are up to date:
+    # ... Authenticode checksum [...] is present in dbx" when the pending
+    # UEFI revocation-database (dbx) update lists the hash of a boot binary
+    # still present in the EFI System Partition — applying it would make
+    # that binary unbootable, so fwupd refuses. This stays a FAIL on
+    # purpose: it needs host-side remediation (update/reinstall shim-signed
+    # and grub-efi-*-signed so the ESP copies are current, reboot, re-run),
+    # not a wider OK_CODES.
+    OK_CODES=2 run_step "fwupd (update)" -- env -u DISPLAY -u XAUTHORITY fwupdmgr update --assume-yes
 else
     warn "fwupdmgr not found; skipping firmware update."
     RESULTS+=("SKIP fwupd (refresh) (not installed)")
@@ -849,14 +870,16 @@ else
 fi
 
 # --- reboot hint -----------------------------------------------------------
-# Did this run replace core packages (kernel, libc, systemd, dbus, ...) that
-# request a reboot? Only deb packages drive an OS reboot, so this is an
-# apt-side check; flatpak/snap/firmware don't (fwupd prints its own
-# reboot messaging when firmware needs one).
+# Did this run stage anything that needs a reboot to finish applying?
 #
 # Ubuntu's mechanism differs from Fedora's `dnf needs-restarting -r`: package
 # postinst scripts touch the marker file /run/reboot-required (and append the
-# requesting package names to /run/reboot-required.pkgs). Those hooks are
+# requesting package names to /run/reboot-required.pkgs). fwupd writes the
+# same marker when firmware is staged to apply on reboot (observed 2026-07:
+# "fwupd" in /run/reboot-required.pkgs after a firmware update with no core
+# deb upgraded), so the marker covers more than deb postinsts — which is why
+# the alert below doesn't claim WHICH kind of update asked; the "Requested
+# by:" list carries that detail. The dpkg-side hooks are
 # shipped by update-notifier-common — WITHOUT that package the marker is
 # never created, so "file absent" would be indistinguishable from "no reboot
 # needed". classify_reboot_marker (defined near run_step, shared with the
@@ -875,7 +898,7 @@ if dpkg-query -W -f '${Status}' update-notifier-common 2>/dev/null | grep -q 'in
 fi
 case "$(classify_reboot_marker "$_marker_exists" "$_notifier_installed")" in
     reboot_required)
-        alert "*** REBOOT REQUIRED *** core packages were updated; reboot to apply them."
+        alert "*** REBOOT REQUIRED *** an update requested a reboot to finish applying."
         # Print the package list so the operator can see what triggered the
         # hint. The .pkgs file may lawfully be absent even when the marker
         # exists (a postinst can touch the marker without appending there).
@@ -888,7 +911,7 @@ case "$(classify_reboot_marker "$_marker_exists" "$_notifier_installed")" in
         ok "No reboot required."
         ;;
     unknown)
-        warn "update-notifier-common is not installed — /run/reboot-required is never created on this system, so reboot status is unknown (not necessarily 'no reboot')."
+        warn "update-notifier-common is not installed — deb updates never create /run/reboot-required on this system, so reboot status is unknown (not necessarily 'no reboot')."
         ;;
 esac
 
