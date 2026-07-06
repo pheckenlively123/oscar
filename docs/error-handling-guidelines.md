@@ -121,6 +121,8 @@ Consequences to preserve:
 
 Use `info`/`ok`/`warn`/`fail` for all user-facing messages — avoid raw `echo`/`printf` for status. They apply consistent coloring/markers. Color variables come from `tput ... 2>/dev/null || true`, so they degrade to empty strings on dumb terminals; never assume color is present.
 
+All helpers — including `fail` and `alert` — write to **stdout** by design: this is an interactive-terminal tool, and the exit code (not the output stream) is the machine-readable failure signal. Do not refactor them to write to stderr.
+
 ## Privilege model
 
-The script re-execs itself under `sudo` (`exec sudo bash "$SELF" "$@"`, where `SELF` is the `realpath`-resolved script path) when not root, because dnf/snap/fwupd need root. `INVOKING_USER` is captured **before** elevation so user-scope work can drop back down via `as_user`. When adding a command that must run as the real user (e.g. `flatpak --user`), wrap it in `as_user`; everything else runs as root after the re-exec — do not add redundant `sudo` calls.
+The script re-execs itself under `sudo` (`exec sudo bash "$SELF" "$@"`, where `SELF` is the `realpath`-resolved script path) when not root, because dnf/pkcon/snap/fwupd need root. `INVOKING_USER` is captured **before** elevation so user-scope work can drop back down via `as_user`. When adding a command that must run as the real user (e.g. `flatpak --user`), wrap it in `as_user`; everything else runs as root after the re-exec — do not add redundant `sudo` calls.

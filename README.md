@@ -23,7 +23,7 @@ Any tool that isn't installed is simply skipped and noted in the summary.
 
 - **Bash** (uses arrays, `[[ ]]`, here-strings — not POSIX `sh`).
 - **A Fedora / systemd Linux system** — this targets `dnf` and Fedora's update stack.
-- **`sudo` / root** — dnf, snap, and fwupd need root. The script re-execs itself under `sudo` automatically; flatpak user-scope work drops back to the invoking user.
+- **`sudo` / root** — dnf, pkcon, snap, and fwupd need root. The script re-execs itself under `sudo` automatically; flatpak user-scope work drops back to the invoking user.
 - **The updater tools you actually use** — `flatpak`, `dnf`, `pkcon`, `snap`, `fwupdmgr`. None are mandatory; missing ones are skipped.
 
 ## Usage

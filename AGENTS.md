@@ -12,6 +12,7 @@ There is no build system, no package manifest, no external test framework, and n
 
 - `scripts/update-all.sh` — the entire tool. All logic lives here.
 - `docs/` — prose guidelines for working in the repo (see docs index below).
+- `.coderabbit.yaml` — feeds `docs/*-guidelines.md` to CodeRabbit as code guidelines; renaming a guidelines doc silently detaches it from review tooling unless this pattern still matches.
 - `README.md` — one-line project description.
 - `LICENSE` — GPL v2.
 

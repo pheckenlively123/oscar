@@ -243,11 +243,21 @@ CURRENT_USER="$(id -un)" \
 # Note: if INVOKING_USER is "root" (direct root execution without sudo),
 # user-scope operations run as root — known limitation; see the warning
 # emitted after the privilege check for details.
+
+# as_user_runs_directly — as_user's direct-vs-sudo branch condition, extracted
+# (like pk_classify_result and friends) so as_user and the selftest's skip
+# guard share one source of truth instead of hand-duplicated expressions that
+# could silently drift apart.
+#
+# The second condition ($CURRENT_USER == $INVOKING_USER) is dead code after the
+# privilege re-exec (CURRENT_USER is always "root" then), but kept as a defensive
+# fallback for non-re-exec contexts such as UPDATE_ALL_SELFTEST=1 mode.
+as_user_runs_directly() {
+    [[ "$INVOKING_USER" == "root" || "$CURRENT_USER" == "$INVOKING_USER" ]]
+}
+
 as_user() {
-    # The second condition ($CURRENT_USER == $INVOKING_USER) is dead code after the
-    # privilege re-exec (CURRENT_USER is always "root" then), but kept as a defensive
-    # fallback for non-re-exec contexts such as UPDATE_ALL_SELFTEST=1 mode.
-    if [[ "$INVOKING_USER" == "root" || "$CURRENT_USER" == "$INVOKING_USER" ]]; then
+    if as_user_runs_directly; then
         "$@"
     else
         # -n: fail fast instead of blocking on a password prompt. An atypical
@@ -406,13 +416,14 @@ if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
         "FAIL test-after-nolabel (exit 2)" "${RESULTS[0]:-}"
 
     # as_user runs directly when already the invoking user. Only assert when
-    # as_user's direct-execution condition actually holds (INVOKING_USER is
-    # "root" or equals CURRENT_USER); if the selftest is invoked with
-    # SUDO_USER set to another user (e.g. run via sudo), as_user takes the
-    # `sudo -n -Hu` branch and $CURRENT_USER would be the wrong expectation —
-    # a false failure. Skipping loses no coverage: the fake-sudo test below
-    # exercises that branch deterministically.
-    if [[ "$INVOKING_USER" == "root" || "$CURRENT_USER" == "$INVOKING_USER" ]]; then
+    # as_user's direct-execution condition actually holds (shared via
+    # as_user_runs_directly, so this guard can never drift from as_user's own
+    # branch); if the selftest is invoked with SUDO_USER set to another user
+    # (e.g. run via sudo), as_user takes the `sudo -n -Hu` branch and
+    # $CURRENT_USER would be the wrong expectation — a false failure.
+    # Skipping loses no coverage: the fake-sudo test below exercises that
+    # branch deterministically.
+    if as_user_runs_directly; then
         _assert "as_user runs directly for the current user" "$CURRENT_USER" "$(as_user id -un)"
     else
         warn "SELFTEST SKIP: as_user direct-execution test (INVOKING_USER='${INVOKING_USER}' differs from CURRENT_USER='${CURRENT_USER}'; sudo branch is covered by the fake-sudo test below)"
@@ -458,6 +469,15 @@ FAKESUDO
     # cover, which caused a real false FAIL in production before this fix.
     _assert "pk_classify(real pkcon 'No packages require updating to newer versions.') → ok" "ok" \
         "$(pk_classify_result 5 'No packages require updating to newer versions.')"
+    # The two optional groups in this alternative — "( to newer versions)?"
+    # and "\.?" — are independent. The two assertions above cover bare
+    # phrase/no period and full phrase/period; cover the remaining two
+    # combinations so a refactor that accidentally couples the groups (e.g.
+    # "( to newer versions\.)?") can't narrow the pattern and still pass.
+    _assert "pk_classify('no packages require updating.' — bare phrase, with period) → ok" "ok" \
+        "$(pk_classify_result 5 'no packages require updating.')"
+    _assert "pk_classify('No packages require updating to newer versions' — full phrase, no period) → ok" "ok" \
+        "$(pk_classify_result 5 'No packages require updating to newer versions')"
     _assert "pk_classify(D-Bus timeout text) → timeout" "timeout" \
         "$(pk_classify_result 1 'Command failed: Timeout was reached')"
     _assert "pk_classify(connection error) → fail" "fail" \
@@ -578,7 +598,7 @@ FAKESUDO
 fi
 
 # --- privilege check -------------------------------------------------------
-# dnf, snap, and fwupd need root. Re-exec under sudo if not already root.
+# dnf, pkcon, snap, and fwupd need root. Re-exec under sudo if not already root.
 #
 # TOCTOU note: SELF is resolved here (pre-elevation) and read again via $0 by
 # the root bash after `exec sudo` below. Deployment assumption: this script
@@ -595,7 +615,7 @@ if [[ $EUID -ne 0 ]]; then
         fail "exec sudo failed — check sudoers policy or sudo authentication."
         exit 1
     else
-        fail "This script needs root (for dnf/snap/fwupd) and sudo is not available."
+        fail "This script needs root (for dnf/pkcon/snap/fwupd) and sudo is not available."
         exit 1
     fi
 fi
