@@ -4,13 +4,14 @@ Onboarding for AI agents (Claude, Cursor, CodeRabbit, etc.) working in the `osca
 
 ## What this repo is
 
-`oscar` is a personal "grab bag" repo (see `README.md`). Today it contains exactly one piece of real code: `scripts/update-all.sh`, a self-contained Fedora Linux system-maintenance script that updates flatpak, dnf, PackageKit (pkcon), snap, and firmware (fwupd), then checks whether a reboot is needed.
+`oscar` is a personal "grab bag" repo (see `README.md`). Today it contains two pieces of real code: `scripts/update-all-fedora.sh` and `scripts/update-all-ubuntu.sh`, self-contained Linux system-maintenance scripts that update flatpak, the system package manager (dnf on Fedora, apt on Ubuntu), PackageKit (pkcon), snap, and firmware (fwupd), then check whether a reboot is needed. They are deliberate siblings: same structure, same helpers, same `RESULTS`/summary contract — a fix to shared logic in one almost always belongs in the other too.
 
-There is no build system, no package manifest, no external test framework, and no CI; the script does have a built-in selftest (see "Validating changes"). The "project" is a single Bash script plus its docs. Keep that shape: do not introduce a framework, config files, dependencies, or a directory structure unless a task genuinely requires it.
+There is no build system, no package manifest, no external test framework, and no CI; each script has a built-in selftest (see "Validating changes"). The "project" is two parallel Bash scripts plus their docs. Keep that shape: do not introduce a framework, config files, dependencies, shared sourced libraries, or a directory structure unless a task genuinely requires it.
 
 ## Layout
 
-- `scripts/update-all.sh` — the entire tool. All logic lives here.
+- `scripts/update-all-fedora.sh` — the Fedora tool. All of its logic lives here.
+- `scripts/update-all-ubuntu.sh` — the Ubuntu sibling. Same shape; distro-specific parts are apt (two steps: refresh + dist-upgrade) and the `/run/reboot-required` marker reboot check (`classify_reboot_marker`) in place of `dnf needs-restarting` (`classify_reboot_result`).
 - `docs/` — prose guidelines for working in the repo (see docs index below).
 - `.coderabbit.yaml` — feeds `docs/*-guidelines.md` to CodeRabbit as code guidelines; renaming a guidelines doc silently detaches it from review tooling unless this pattern still matches.
 - `README.md` — one-line project description.
@@ -27,18 +28,18 @@ Read the relevant guideline before changing matching code. These are authoritati
 ### Script shape and dependencies
 
 - `#!/usr/bin/env bash` — Bash features (arrays, `[[ ]]`, `<<<` here-strings, `${VAR:-default}`) are expected and fine.
-- The script is **self-contained and argument-less**: no flag parsing, no config file, no sourced helper libraries. Do not add external dependencies.
+- Each script is **self-contained and argument-less**: no flag parsing, no config file, no sourced helper libraries. Do not add external dependencies. The shared helpers are intentionally *duplicated* between the two scripts, not factored into a sourced file — self-containment wins over DRY here; keep parallel edits in sync by hand.
 - `"$@"` is forwarded through the `sudo` re-exec. If you add argument handling, it must survive that re-exec — args are parsed *after* re-execution, as root.
 
 ### Structure and ordering
 
-- The body is organized as **numbered, commented sections** (`# 1. Flatpak`, `# 2. dnf`, `# 2b. PackageKit`, etc.) divided by `# --- section title ---` rule comments.
-- Order matters where there are data dependencies: PackageKit (`2b`) refreshes *after* dnf (`2`) because dnf changes the package set pkcon caches. Preserve such ordering and document it inline when you add a step.
+- The body is organized as **numbered, commented sections** (`# 1. Flatpak`, `# 2. dnf` / `# 2. apt`, `# 2b. PackageKit`, etc.) divided by `# --- section title ---` rule comments.
+- Order matters where there are data dependencies: PackageKit (`2b`) refreshes *after* the system package manager (`2`) because dnf/apt changes the package set pkcon caches. Preserve such ordering and document it inline when you add a step.
 - New updaters generally slot into this numbered list before the `# --- summary ---` section.
 
 ### Comment style — explain *why*, not *what*
 
-This script is deliberately comment-heavy, and comments justify decisions rather than narrate code (e.g. the long PackageKit explanation, the dnf4-vs-dnf5 `--reboothint` note, why `set -e` is omitted). When a line exists to work around a tool quirk or non-obvious behavior, write the rationale next to it.
+These scripts are deliberately comment-heavy, and comments justify decisions rather than narrate code (e.g. the long PackageKit explanation, the dnf4-vs-dnf5 `--reboothint` note, why `set -e` is omitted). When a line exists to work around a tool quirk or non-obvious behavior, write the rationale next to it.
 
 ### Shell idioms used throughout
 
@@ -69,8 +70,9 @@ This script is deliberately comment-heavy, and comments justify decisions rather
 
 ## Validating changes
 
-There is no external test framework, but the script has a built-in selftest. Before considering a change done:
-- Run `UPDATE_ALL_SELFTEST=1 bash scripts/update-all.sh` — an assertion suite covering `run_step`, `OK_CODES` handling, the classifiers, `as_user`, and the flock primitive. It runs unprivileged and must report zero failures.
-- Run `bash -n scripts/update-all.sh` (syntax check) and, if available, `shellcheck scripts/update-all.sh`.
+There is no external test framework, but each script has a built-in selftest. Before considering a change done (for every script you touched):
+- Run `UPDATE_ALL_SELFTEST=1 bash scripts/update-all-<distro>.sh` — an assertion suite covering `run_step`, `OK_CODES` handling, the classifiers, `as_user`, and the flock primitive. It runs unprivileged and must report zero failures.
+- Run `bash -n scripts/update-all-<distro>.sh` (syntax check) and, if available, `shellcheck scripts/update-all-<distro>.sh`.
+- If the change touched logic that exists in both scripts (the shared helpers/classifiers), apply and validate it in both.
 - Verify every code path touching a tool appends exactly one `RESULTS` line with the correct keyword prefix.
 - Do not actually run the updaters in an unintended environment — the script mutates the host system and requires root.
