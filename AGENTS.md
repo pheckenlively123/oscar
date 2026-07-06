@@ -6,12 +6,13 @@ Onboarding for AI agents (Claude, Cursor, CodeRabbit, etc.) working in the `osca
 
 `oscar` is a personal "grab bag" repo (see `README.md`). Today it contains exactly one piece of real code: `scripts/update-all.sh`, a self-contained Fedora Linux system-maintenance script that updates flatpak, dnf, PackageKit (pkcon), snap, and firmware (fwupd), then checks whether a reboot is needed.
 
-There is no build system, no package manifest, no test suite, and no CI. The "project" is a single Bash script plus its docs. Keep that shape: do not introduce a framework, config files, dependencies, or a directory structure unless a task genuinely requires it.
+There is no build system, no package manifest, no external test framework, and no CI; the script does have a built-in selftest (see "Validating changes"). The "project" is a single Bash script plus its docs. Keep that shape: do not introduce a framework, config files, dependencies, or a directory structure unless a task genuinely requires it.
 
 ## Layout
 
 - `scripts/update-all.sh` — the entire tool. All logic lives here.
 - `docs/` — prose guidelines for working in the repo (see docs index below).
+- `.coderabbit.yaml` — feeds `docs/*-guidelines.md` to CodeRabbit as code guidelines; renaming a guidelines doc silently detaches it from review tooling unless this pattern still matches.
 - `README.md` — one-line project description.
 - `LICENSE` — GPL v2.
 
@@ -68,7 +69,8 @@ This script is deliberately comment-heavy, and comments justify decisions rather
 
 ## Validating changes
 
-There is no test harness. Before considering a change done:
+There is no external test framework, but the script has a built-in selftest. Before considering a change done:
+- Run `UPDATE_ALL_SELFTEST=1 bash scripts/update-all.sh` — an assertion suite covering `run_step`, `OK_CODES` handling, the classifiers, `as_user`, and the flock primitive. It runs unprivileged and must report zero failures.
 - Run `bash -n scripts/update-all.sh` (syntax check) and, if available, `shellcheck scripts/update-all.sh`.
 - Verify every code path touching a tool appends exactly one `RESULTS` line with the correct keyword prefix.
 - Do not actually run the updaters in an unintended environment — the script mutates the host system and requires root.
