@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# update-all.sh — update flatpak, dnf (system), snap, and firmware (fwupd).
+# update-all.sh — update flatpak, dnf (system), PackageKit (Discover sync),
+# snap, and firmware (fwupd), then check whether a reboot is required.
 #
 # Each updater runs independently; a failure in one does not stop the others.
 # A summary of successes/failures is printed at the end.
@@ -8,7 +9,7 @@
 # Scope notes:
 #   * Flatpak is updated for BOTH the per-user and system-wide installations.
 #     The user-scope update runs as the invoking user, not as root.
-#   * dnf, snap, and fwupd require root and run under sudo.
+#   * dnf, pkcon, snap, and fwupd require root and run under sudo.
 
 set -u  # treat unset variables as errors; we intentionally do NOT use -e
         # because we want to keep going after a failed updater.
@@ -195,8 +196,8 @@ classify_reboot_result() {
     # unrelated dnf5 argument-parsing error; require it to actually be about
     # needs-restarting (dnf5's real wording: 'Unknown argument
     # "needs-restarting" for command "dnf5".' — unverified against a real
-    # dnf5 build, see L5 in review.md, but this at least scopes the match to
-    # the subcommand we care about instead of any "unknown argument" error).
+    # dnf5 build, but this at least scopes the match to the subcommand we
+    # care about instead of any "unknown argument" error).
     if grep -qiE 'no such command|unknown subcommand|unknown argument.*needs-restarting' <<<"$out"; then
         echo "no_plugin"
     elif [[ $rc -eq 0 ]]; then
@@ -261,7 +262,7 @@ as_user() {
 #   UPDATE_ALL_SELFTEST=1 bash scripts/update-all.sh
 # UPDATE_ALL_LOCK_FILE parameterizes the mutual-exclusion guard's path so it
 # doesn't have to touch the real /run/update-all.lock, but this does NOT
-# bypass the privilege check above: run as an unprivileged user, invocation
+# bypass the privilege check below: run as an unprivileged user, invocation
 # still stops at "needs root" before ever reaching the lock guard, same as
 # any other run. It only becomes useful once already root/sudo, e.g.:
 #   sudo UPDATE_ALL_LOCK_FILE=/tmp/update-all-test.lock bash scripts/update-all.sh
@@ -307,12 +308,12 @@ if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
 
     info "Running selftests..."
 
-    # L15: have() finds real commands and rejects nonexistent ones
+    # have() finds real commands and rejects nonexistent ones
     _assert "have finds a real command (bash)" "yes" "$(have bash && echo yes || echo no)"
     _assert "have rejects a nonexistent command" "no" \
         "$(have this-command-does-not-exist-xyz123 && echo yes || echo no)"
 
-    # L14: a stale/exported OK_CODES from the CALLING shell — i.e. present
+    # A stale/exported OK_CODES from the CALLING shell — i.e. present
     # BEFORE this script's own top-level "OK_CODES=\"\"" guard runs — must
     # not leak into the first run_step call. Setting OK_CODES in *this* shell
     # immediately before the call (the previous version of this test) can't
@@ -330,37 +331,37 @@ if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
     _assert "stale/exported OK_CODES doesn't leak into first call" \
         "FAIL test-envguard (exit 1)" "$_envguard_got"
 
-    # H1: run_step exit 0 → OK result
+    # run_step exit 0 → OK result
     RESULTS=()
     run_step "test-ok" -- bash -c 'exit 0'
     _assert "run_step(exit 0) → OK" "OK   test-ok" "${RESULTS[0]:-}"
     _assert "run_step(exit 0) → exactly one RESULTS entry" "1" "${#RESULTS[@]}"
 
-    # H1: run_step exit 1 → FAIL result
+    # run_step exit 1 → FAIL result
     RESULTS=()
     run_step "test-fail" -- bash -c 'exit 1'
     _assert "run_step(exit 1) → FAIL" "FAIL test-fail (exit 1)" "${RESULTS[0]:-}"
     _assert "run_step(exit 1) → exactly one RESULTS entry" "1" "${#RESULTS[@]}"
 
-    # H1: OK_CODES extra code is accepted
+    # OK_CODES extra code is accepted
     RESULTS=()
     OK_CODES=2 run_step "test-ok2" -- bash -c 'exit 2'
     _assert "run_step(OK_CODES=2, exit 2) → OK" "OK   test-ok2" "${RESULTS[0]:-}"
     _assert "run_step(OK_CODES=2, exit 2) → exactly one RESULTS entry" "1" "${#RESULTS[@]}"
 
-    # M5: multi-value OK_CODES — a non-first code in the list is also accepted
+    # Multi-value OK_CODES — a non-first code in the list is also accepted
     RESULTS=()
     OK_CODES="2 3" run_step "test-ok3" -- bash -c 'exit 3'
     _assert "run_step(OK_CODES='2 3', exit 3) → OK" "OK   test-ok3" "${RESULTS[0]:-}"
     _assert "run_step(OK_CODES='2 3', exit 3) → exactly one RESULTS entry" "1" "${#RESULTS[@]}"
 
-    # H1: OK_CODES resets between calls — must not leak to the next call
+    # OK_CODES resets between calls — must not leak to the next call
     RESULTS=()
     run_step "test-noleak" -- bash -c 'exit 2'
     _assert "OK_CODES does not leak" "FAIL test-noleak (exit 2)" "${RESULTS[0]:-}"
     _assert "OK_CODES does not leak → exactly one RESULTS entry" "1" "${#RESULTS[@]}"
 
-    # L2/L12: malformed OK_CODES values are rejected before the command runs
+    # Malformed OK_CODES values are rejected before the command runs
     RESULTS=()
     OK_CODES="abc" run_step "test-badcodes" -- bash -c 'exit 0'
     _assert "invalid OK_CODES (non-numeric) → FAIL" \
@@ -385,16 +386,16 @@ if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
         "FAIL test-badcodes-mixed (invalid OK_CODES)" "${RESULTS[0]:-}"
     _assert "invalid OK_CODES (mixed valid/invalid) → exactly one RESULTS entry" "1" "${#RESULTS[@]}"
 
-    # L4: no-command branch emits the right RESULTS label
+    # No-command branch emits the right RESULTS label
     RESULTS=()
     run_step "test-nocmd"
     _assert "no-command → RESULTS label" \
         "FAIL test-nocmd (no command provided to run_step)" "${RESULTS[0]:-}"
     _assert "no-command → exactly one RESULTS entry" "1" "${#RESULTS[@]}"
 
-    # L6: no-label guard itself — a call with an empty label must degrade
+    # No-label guard itself — a call with an empty label must degrade
     # through the FAIL/RESULTS path (not abort under set -u) and must not
-    # leak whatever OK_CODES was set alongside it into the next call (M3).
+    # leak whatever OK_CODES was set alongside it into the next call.
     RESULTS=()
     OK_CODES=2 run_step ""
     _assert "no-label → RESULTS label" "FAIL run_step (no label)" "${RESULTS[0]:-}"
@@ -404,12 +405,20 @@ if [[ "${UPDATE_ALL_SELFTEST:-}" == "1" ]]; then
     _assert "no-label call's OK_CODES does not leak into the next call" \
         "FAIL test-after-nolabel (exit 2)" "${RESULTS[0]:-}"
 
-    # M1: as_user runs directly when already the invoking user — true in the
-    # normal (non-sudo) selftest invocation, where INVOKING_USER is either the
-    # current user or "root" (see the as_user fallback comment above).
-    _assert "as_user runs directly for the current user" "$CURRENT_USER" "$(as_user id -un)"
+    # as_user runs directly when already the invoking user. Only assert when
+    # as_user's direct-execution condition actually holds (INVOKING_USER is
+    # "root" or equals CURRENT_USER); if the selftest is invoked with
+    # SUDO_USER set to another user (e.g. run via sudo), as_user takes the
+    # `sudo -n -Hu` branch and $CURRENT_USER would be the wrong expectation —
+    # a false failure. Skipping loses no coverage: the fake-sudo test below
+    # exercises that branch deterministically.
+    if [[ "$INVOKING_USER" == "root" || "$CURRENT_USER" == "$INVOKING_USER" ]]; then
+        _assert "as_user runs directly for the current user" "$CURRENT_USER" "$(as_user id -un)"
+    else
+        warn "SELFTEST SKIP: as_user direct-execution test (INVOKING_USER='${INVOKING_USER}' differs from CURRENT_USER='${CURRENT_USER}'; sudo branch is covered by the fake-sudo test below)"
+    fi
 
-    # M6: the `sudo -n -Hu ...` branch was previously only reachable by
+    # The `sudo -n -Hu ...` branch was previously only reachable by
     # happenstance (whether INVOKING_USER == CURRENT_USER held in the test
     # environment) — never deterministically exercised. Force that branch by
     # setting CURRENT_USER/INVOKING_USER to differ, and fake a `sudo` on PATH
@@ -435,7 +444,7 @@ FAKESUDO
         _st_fail=$(( _st_fail + 1 ))
     fi
 
-    # H2/H3: pk_classify_result is the single source of truth shared with the
+    # pk_classify_result is the single source of truth shared with the
     # live PackageKit step (2b) below — exercise all three outcomes end-to-end
     # (not just the raw grep pattern in isolation).
     _assert "pk_classify(rc=0, empty output) → ok" "ok" "$(pk_classify_result 0 '')"
@@ -457,11 +466,11 @@ FAKESUDO
     _assert "pk_classify('updated 0 packages') → fail" "fail" \
         "$(pk_classify_result 1 'updated 0 packages')"
 
-    # M2/M3: every PK_NOTHING_TO_DO_PATTERN alternative is anchored to a whole
+    # Every PK_NOTHING_TO_DO_PATTERN alternative is anchored to a whole
     # line — a "nothing to do"-class phrase embedded inside a longer error
     # line must NOT be classified as ok. Previously only "nothing to do"
     # itself was anchored; the other three were unanchored substrings with
-    # the same false-OK collision risk (High finding #1's class of bug).
+    # the same false-OK collision risk.
     _assert "pk_classify('Error: nothing to do, aborting') → fail" "fail" \
         "$(pk_classify_result 1 'Error: nothing to do, aborting')"
     _assert "pk_classify('nothing to update' embedded in error) → fail" "fail" \
@@ -471,7 +480,7 @@ FAKESUDO
     _assert "pk_classify('no packages require updating' embedded in error) → fail" "fail" \
         "$(pk_classify_result 1 'no packages require updating: transaction aborted')"
 
-    # M7: the ^...$ anchors are per-line under `grep` with a here-string, so a
+    # The ^...$ anchors are per-line under `grep` with a here-string, so a
     # "nothing to do"-class phrase sitting alone on ITS OWN line within a
     # multi-line capture must still classify as ok, even with other
     # unrelated lines (banners, progress output) around it.
@@ -483,7 +492,7 @@ FAKESUDO
     _assert "pk_classify('Nothing to do.' with trailing period) → fail" "fail" \
         "$(pk_classify_result 1 'Nothing to do.')"
 
-    # H1: the "timeout" outcome requires BOTH rc==1 AND the specific message.
+    # The "timeout" outcome requires BOTH rc==1 AND the specific message.
     # Confirm the rc gate actually matters: the exact message text with a
     # non-1 rc (e.g. a genuine network-layer timeout surfacing as some other
     # exit code) must fail, not be swallowed as the benign D-Bus race.
@@ -495,7 +504,7 @@ FAKESUDO
     _assert "pk_classify(bare 'timeout was reached' substring) → fail" "fail" \
         "$(pk_classify_result 1 'curl: (28) Operation timeout was reached')"
 
-    # M4: pk_note_for covers all 4 dnf_failed/pk_refresh_failed combinations —
+    # pk_note_for covers all 4 dnf_failed/pk_refresh_failed combinations —
     # extracted (like pk_classify_result) so each is independently testable.
     _assert "pk_note_for(0,0) → no annotation" "" "$(pk_note_for 0 0)"
     _assert "pk_note_for(1,0) → dnf-failed annotation" \
@@ -506,7 +515,7 @@ FAKESUDO
         " (dnf upgrade failed — sync may run against a non-post-upgrade state) (cache refresh failed — result unverified)" \
         "$(pk_note_for 1 1)"
 
-    # H4: classify_reboot_result covers all 5 branches (previously zero
+    # classify_reboot_result covers all 5 branches (previously zero
     # selftest coverage despite being the same shape of problem
     # pk_classify_result was extracted to solve).
     _assert "classify_reboot(dnf4 'no such command') → no_plugin" "no_plugin" \
@@ -527,7 +536,7 @@ FAKESUDO
         "$(classify_reboot_result 1 'Error: repository metadata failed to load')"
     _assert "classify_reboot(rc=3, unexpected) → unknown" "unknown" \
         "$(classify_reboot_result 3 'weird output')"
-    # M2: branch precedence — the no_plugin grep runs unconditionally before
+    # Branch precedence — the no_plugin grep runs unconditionally before
     # the rc-based branches, so output containing BOTH a plugin-missing
     # phrase and the word "error" must still resolve to no_plugin, not
     # ambiguous. Confirms that precedence explicitly rather than leaving it
@@ -535,15 +544,14 @@ FAKESUDO
     _assert "classify_reboot(no_plugin text that also contains 'error') → no_plugin (precedence)" "no_plugin" \
         "$(classify_reboot_result 1 'Error: no such command: needs-restarting')"
 
-    # L11: the flock mechanism actually serializes — a second non-blocking
+    # The flock mechanism actually serializes — a second non-blocking
     # flock against an already-held lock must fail immediately. Exercises the
     # same primitive as the mutual-exclusion guard below, without needing root
     # or the real /run/update-all.lock path.
     # Plain mktemp (not `mktemp -u`), which creates the file atomically —
     # `-u` only reserves a filename without creating it, a TOCTOU-prone
     # pattern (a symlink/file could be planted at that path before the exec
-    # below opens it). Low impact here (unprivileged selftest-only code) but
-    # inconsistent with the care taken elsewhere in the script.
+    # below opens it).
     _lock_test_file="$(mktemp)"
     { exec 8>"$_lock_test_file"; } 2>/dev/null
     if flock -n 8; then
@@ -581,6 +589,7 @@ SELF="$(realpath -- "$0")" || { fail "Cannot resolve script path for '$0'."; exi
 if [[ $EUID -ne 0 ]]; then
     if have sudo; then
         info "Elevating privileges with sudo (flatpak user-scope runs as you)..."
+        # shellcheck disable=SC2093  # exec is intentional; the lines below only run if it fails
         exec sudo /bin/bash "$SELF" "$@"
         # exec only returns on failure
         fail "exec sudo failed — check sudoers policy or sudo authentication."
@@ -730,7 +739,7 @@ if have pkcon; then
     # LANGUAGE (GLib checks them first), so non-English locales would defeat the grep below.
     # Note: -y is a non-interactive hint (suppress confirmation prompts); pkcon may
     # silently ignore it if the installed version does not recognise this flag.
-    pk_out=$(LC_ALL=C LANGUAGE= pkcon update -y -p 2>&1); pk_rc=$?
+    pk_out=$(LC_ALL=C LANGUAGE='' pkcon update -y -p 2>&1); pk_rc=$?
     printf '%s\n' "$pk_out"
 
     # pk_note_for (defined near run_step, shared with the selftest) is the
@@ -826,7 +835,7 @@ if have dnf; then
     # grep-based classification below (missing-plugin detection, and the
     # ambiguous-vs-required "error" sanity check), risking a false
     # "*** REBOOT REQUIRED ***" alert on a genuinely unrelated dnf error.
-    reboot_out=$(LC_ALL=C LANGUAGE= dnf needs-restarting -r 2>&1); reboot_rc=$?
+    reboot_out=$(LC_ALL=C LANGUAGE='' dnf needs-restarting -r 2>&1); reboot_rc=$?
     # classify_reboot_result (defined near run_step, shared with the
     # selftest) is the single source of truth for this 5-branch
     # classification — `-r` exits 0 (no reboot needed) or 1 (reboot
