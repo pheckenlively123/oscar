@@ -16,8 +16,8 @@ set -u  # treat unset variables as errors; we intentionally do NOT use -e
 
 # Pin PATH to a known-safe value so all tool lookups are predictable when
 # running as root regardless of the invoking user's PATH. All tools used by
-# this script (dnf, flatpak, pkcon, fwupdmgr, snap, flock, id, realpath,
-# tput, grep, bash) live in /usr/sbin or /usr/bin on Fedora.
+# this script (dnf, flatpak, pkcon, fwupdmgr, snap, env, flock, id,
+# realpath, tput, grep, bash) live in /usr/sbin or /usr/bin on Fedora.
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 # --- pretty output helpers -------------------------------------------------
@@ -803,13 +803,21 @@ fi
 
 # 4. fwupd — firmware (BIOS/UEFI, SSDs, docks, peripherals via LVFS).
 if have fwupdmgr; then
+    # env -u DISPLAY -u XAUTHORITY: DISPLAY often survives into the root
+    # environment (sudoers env_keep, SSH X11 forwarding) while the matching
+    # XAUTHORITY cookie does not, so fwupdmgr's display probe fails with a
+    # noisy "X11 connection rejected because of wrong authentication." line
+    # interleaved with its real output (observed on the Ubuntu sibling;
+    # same mechanism applies here). fwupdmgr needs no display; unset both
+    # so its output stays clean.
+    #
     # Refresh metadata. --force avoids the "refreshed too recently" error.
     # Exit code 2 means "metadata already current" — treat as success.
-    OK_CODES=2 run_step "fwupd (refresh)" -- fwupdmgr refresh --force
+    OK_CODES=2 run_step "fwupd (refresh)" -- env -u DISPLAY -u XAUTHORITY fwupdmgr refresh --force
     # Apply updates. Exit code 2 means "nothing to do" — treat as success.
     # Note: some firmware applies on next reboot rather than immediately.
     # --assume-yes requires fwupd >= 1.3.0 (Fedora 30+)
-    OK_CODES=2 run_step "fwupd (update)" -- fwupdmgr update --assume-yes
+    OK_CODES=2 run_step "fwupd (update)" -- env -u DISPLAY -u XAUTHORITY fwupdmgr update --assume-yes
 else
     warn "fwupdmgr not found; skipping firmware update."
     RESULTS+=("SKIP fwupd (refresh) (not installed)")
