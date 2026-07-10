@@ -217,6 +217,38 @@ classify_reboot_result() {
     fi
 }
 
+# fwupd_classify_update <rc> <output> — classify a `fwupdmgr update` outcome
+# from its exit code and captured stdout/stderr text. Echoes exactly one of:
+#   ok          — rc 0, or rc 2 ("nothing to do" — no updates available)
+#   dbx_blocked — failure where fwupd refuses to apply a UEFI
+#                 revocation-database (dbx) update because a boot binary
+#                 still present in the EFI System Partition is on the new
+#                 revocation list ("Blocked executable in the ESP, ensure
+#                 grub and shim are up to date: ... Authenticode checksum
+#                 [...] is present in dbx" — observed 2026-07 on the Ubuntu
+#                 sibling; fwupd's behavior, not the distro's, so it applies
+#                 here too); applying it would make that binary unbootable.
+#                 Still a genuine failure (the dbx security update stays
+#                 pending), but one with a known host-side fix, so the call
+#                 site prints a remediation hint alongside the FAIL.
+#   fail        — any other genuine failure
+# The dbx match is a bare substring, unlike PK_NOTHING_TO_DO_PATTERN's
+# whole-line anchors: fwupd embeds the phrase mid-line so anchoring is
+# impossible, and it's safe anyway — dbx_blocked and fail both report FAIL,
+# so a stray match can only add the hint, never flip a failure to success.
+# Extracted (like pk_classify_result) so the selftest covers the branches
+# directly instead of only via the live call site.
+fwupd_classify_update() {
+    local rc=${1:-} out=${2:-}
+    if [[ $rc -eq 0 || $rc -eq 2 ]]; then
+        echo "ok"
+    elif grep -qi 'is present in dbx' <<<"$out"; then
+        echo "dbx_blocked"
+    else
+        echo "fail"
+    fi
+}
+
 # --- identify the invoking (non-root) user ---------------------------------
 # Captured BEFORE we elevate, so we can run user-scope flatpak as them.
 INVOKING_USER="${SUDO_USER:-${USER:-root}}"
@@ -564,6 +596,24 @@ FAKESUDO
     _assert "classify_reboot(no_plugin text that also contains 'error') → no_plugin (precedence)" "no_plugin" \
         "$(classify_reboot_result 1 'Error: no such command: needs-restarting')"
 
+    # fwupd_classify_update covers all three outcomes. The dbx message is
+    # verbatim from the real 2026-07 transcript that motivated the
+    # dbx_blocked branch — captured on the Ubuntu sibling (hence the Ubuntu
+    # ESP path), but the matched phrase is fwupd's own, distro-independent.
+    _fw_dbx_msg='Blocked executable in the ESP, ensure grub and shim are up to date: /boot/efi/EFI/UBUNTU/SHIMX64.EFI Authenticode checksum [2ea4cb6a1f1eb1d3dce82d54fde26ded243ba3e18de7c6d211902a594fe56788] is present in dbx'
+    _assert "fwupd_classify(rc=0) → ok" "ok" "$(fwupd_classify_update 0 '')"
+    _assert "fwupd_classify(rc=2, nothing to do) → ok" "ok" \
+        "$(fwupd_classify_update 2 'No updatable devices')"
+    _assert "fwupd_classify(rc=1, real dbx transcript) → dbx_blocked" "dbx_blocked" \
+        "$(fwupd_classify_update 1 "$_fw_dbx_msg")"
+    _assert "fwupd_classify(rc=1, other error) → fail" "fail" \
+        "$(fwupd_classify_update 1 'failed to connect to daemon')"
+    # rc precedence: a clean/nothing-to-do exit is ok even if the dbx phrase
+    # appears somewhere in the output (e.g. as a warning about a different,
+    # skipped device) — nothing failed, so there is nothing to hint about.
+    _assert "fwupd_classify(rc=0, dbx text) → ok (rc wins)" "ok" \
+        "$(fwupd_classify_update 0 "$_fw_dbx_msg")"
+
     # The flock mechanism actually serializes — a second non-blocking
     # flock against an already-held lock must fail immediately. Exercises the
     # same primitive as the mutual-exclusion guard below, without needing root
@@ -644,7 +694,7 @@ _LOCK_FILE="${UPDATE_ALL_LOCK_FILE:-/run/update-all.lock}"
 # stderr for all subsequent commands (bare `exec 9>... 2>/dev/null` would
 # permanently close stderr for the entire rest of the script).
 # Note: fd 9 is not close-on-exec, so it is inherited by every child process
-# run via run_step (dnf, flatpak, pkcon, snap, fwupdmgr). None of those are
+# this script runs (dnf, flatpak, pkcon, snap, fwupdmgr). None of those are
 # expected to background/daemonize themselves while holding it; if one ever
 # does, the lock would outlive this script and wrongly reject the next run.
 # stderr is captured to a temp file (rather than a variable via $(...))
@@ -814,10 +864,41 @@ if have fwupdmgr; then
     # Refresh metadata. --force avoids the "refreshed too recently" error.
     # Exit code 2 means "metadata already current" — treat as success.
     OK_CODES=2 run_step "fwupd (refresh)" -- env -u DISPLAY -u XAUTHORITY fwupdmgr refresh --force
-    # Apply updates. Exit code 2 means "nothing to do" — treat as success.
+    # Apply updates. NOT run_step: fwupd_classify_update (defined near
+    # run_step, shared with the selftest) needs the captured output text to
+    # recognise the dbx-blocked failure mode, so this follows the same
+    # capture-print-classify pattern as step 2b. The classifier treats exit
+    # code 2 ("nothing to do") as success, replacing the OK_CODES=2 handling
+    # the refresh above still uses.
     # Note: some firmware applies on next reboot rather than immediately.
-    # --assume-yes requires fwupd >= 1.3.0 (Fedora 30+)
-    OK_CODES=2 run_step "fwupd (update)" -- env -u DISPLAY -u XAUTHORITY fwupdmgr update --assume-yes
+    # --assume-yes requires fwupd >= 1.3.0 (Fedora 30+).
+    # LC_ALL=C LANGUAGE= force English output so the dbx grep can't be
+    # defeated by a non-English locale (same reasoning as the pkcon step).
+    info "Updating fwupd (update)..."
+    fw_out=$(env -u DISPLAY -u XAUTHORITY LC_ALL=C LANGUAGE= fwupdmgr update --assume-yes 2>&1); fw_rc=$?
+    printf '%s\n' "$fw_out"
+    case "$(fwupd_classify_update "$fw_rc" "$fw_out")" in
+        ok)
+            ok "fwupd (update) update completed."
+            RESULTS+=("OK   fwupd (update)")
+            ;;
+        dbx_blocked)
+            # Deliberately still a FAIL, not OK/SKIP: the pending dbx update
+            # is a real security update, and masking the failure would hide
+            # a stale revocation database. The hint just makes the failure
+            # actionable at run time — remediation is host-side, not
+            # script-side (rewriting ESP boot binaries is exactly what an
+            # unattended updater must not do on its own).
+            fail "fwupd (update) update failed (exit code ${fw_rc})."
+            warn "fwupd refused the UEFI dbx update: a boot binary still in the EFI System Partition (named above) is on the new revocation list, so applying the update would make it unbootable."
+            warn "Fix: sudo dnf reinstall 'shim-*' 'grub2-efi-*'  (refreshes the ESP copies), reboot, then re-run this script."
+            RESULTS+=("FAIL fwupd (update) (exit ${fw_rc}) (dbx blocked — see hint above)")
+            ;;
+        *)
+            fail "fwupd (update) update failed (exit code ${fw_rc})."
+            RESULTS+=("FAIL fwupd (update) (exit ${fw_rc})")
+            ;;
+    esac
 else
     warn "fwupdmgr not found; skipping firmware update."
     RESULTS+=("SKIP fwupd (refresh) (not installed)")
